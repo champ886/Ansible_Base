@@ -1,0 +1,92 @@
+---
+argument_specs:
+  main:
+    short_description: Create network backup and write to datastore.
+    description:
+      - Create network backup and write to datastore.
+    author:
+      - Rohit Thakur (rohitthakur2590)
+    options:
+      type:
+        description:
+          - Defines the type of backup to perform. Options are "full", "incremental", or "diff".
+        type: str
+        required: false
+        choices:
+          - full
+          - incremental
+          - diff
+
+      data_store:
+        description:
+          - Specifies the data store configuration, which can be either local or SCM or SSH. Includes details like path for local storage or URL, token, and user info for SCM.
+        type: dict
+        required: true
+        options:
+          local:
+            description:
+              - Specify the local data store.
+            type: dict
+            required: false
+            options:
+              path:
+                type: str
+                required: true
+                description:
+                  - Path inside the SCM repository where the backup will be saved (e.g., data/backups/<date>/<platform>).
+              filename:
+                type: str
+                required: false
+                description:
+                  - Filename for the backup stored in the SCM (e.g., <platform>_<date>.txt).
+          scm:
+            description:
+              - Specify the SCM data store.
+            type: dict
+            required: false
+            options:
+              origin:
+                type: dict
+                required: true
+                options:
+                  url:
+                    type: str
+                    required: true
+                    description:
+                      - URL of the SCM repository (e.g., GitHub) where backups are stored.
+                  token:
+                    type: str
+                    no_log: true
+                    description:
+                      - Authentication token for accessing the SCM repository.
+                  user:
+                    type: dict
+                    required: true
+                    options:
+                      name:
+                        type: str
+                        required: true
+                        description:
+                          - Username for the SCM repository.
+                      email:
+                        type: str
+                        required: true
+                        description:
+                          - Email associated with the SCM repository account.
+                  path:
+                    type: str
+                    required: true
+                    description:
+                      - Path inside the SCM repository where the backup will be saved (e.g., data/backups/<date>/<platform>).
+                  filename:
+                    type: str
+                    required: true
+                    description:
+                      - Filename for the backup stored in the SCM (e.g., <platform>_<date>.txt).
+                  ssh_key_file:
+                    type: str
+                    description: "Path to the SSH private key file for Git authentication."
+                  ssh_key_content:
+                    type: str
+                    description: "The content of the SSH private key for Git authentication (e.g., from Vault)."
+                    no_log: true

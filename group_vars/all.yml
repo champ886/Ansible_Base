@@ -1,0 +1,1180 @@
+---
+# ========================================================================
+# Cisco ForeScout 802.1X Baseline Configuration
+# Device: cticblrm6ncas01-cp94 (Catalyst 9300-48UXM)
+# Model: C9300-48UXM (48x 1GE + 48x 10GE + 2x 40GE)
+# IOS-XE Version: 17.9
+# Last Updated: 2025-10-30
+# Purpose: ForeScout NAC Integration with 802.1X Port-Based Access Control
+# ========================================================================
+
+
+## Forescout VIP ##
+tvt_forescout_vip_1: 10.220.50.33
+
+## Interafce Jinja2 variables ##
+dot1x_keywords_prod:
+  - Workstation
+
+## Interafce Jinja2 variables ##
+dot1x_keywords:
+  - test-aaa
+
+## Policy-map vars ##
+policy_name: "PORT-AUTH-POLICY"
+dot1x_retries: 2
+dot1x_retry_time: 7
+auth_restart_timer: 60
+failopen_data_template: "TEMPLATE_FAILOPEN_DATA"
+failopen_voice_template: "TEMPLATE_FAILOPEN_VOICE"
+pass_auth_data_template: "TEMPLATE_PASS_AUTH_DATA"
+pass_auth_voice_template: "TEMPLATE_PASS_AUTH_VOICE"
+
+# RADIUS Server Configuration
+radius_servers:
+  - name: FORESCOUT_RADIUS_VIP1
+    address: 10.220.50.33
+    auth_port: 1812
+    acct_port: 1813
+    timeout: 5
+    automate_tester:
+      username: radiushealthcheck
+      ignore_acct_port: true
+      idle_time: 4
+    key: "0505070C741F4D1B5A114441"
+    key_type: 7
+
+  - name: FORESCOUT_RADIUS_VIP2
+    address: 10.220.50.34
+    auth_port: 1812
+    acct_port: 1813
+    timeout: 5
+    automate_tester:
+      username: radiushealthcheck
+      ignore_acct_port: true
+      idle_time: 4
+    key: "000A1205510808144C351F1D"
+    key_type: 7
+
+# AAA Group Server Configuration
+aaa_group_servers:
+  - name: FORESCOUT
+    type: radius
+    servers:
+      - FORESCOUT_RADIUS_VIP1
+      - FORESCOUT_RADIUS_VIP2
+    source_interface: Loopback0
+    deadtime: 5
+
+# AAA Authentication Configuration
+aaa_authentication:
+  dot1x:
+    default: "group FORESCOUT"
+
+# AAA Authorization Configuration
+aaa_authorization:
+  network:
+    default: "group FORESCOUT"
+
+# AAA Accounting Configuration
+aaa_accounting:
+  identity_default: "start-stop group FORESCOUT"
+  network_default: "start-stop group FORESCOUT"
+  update_newinfo_periodic: 2880
+
+# AAA Server RADIUS Dynamic Author (CoA)
+radius_dynamic_author:
+  clients:
+    - address: 10.220.50.33
+      server_key: "1217041447580F16693F777B"
+      key_type: 7
+    - address: 10.220.50.34
+      server_key: "1217041447580F16693F777B"
+      key_type: 7
+
+# RADIUS Server Attributes
+radius_attributes:
+  attribute_6: true  # on-for-login-auth
+  attribute_8: true  # include-in-access-req
+  attribute_32:
+    enabled: true
+    format: "CBA-CISCO-SW-%i"
+  attribute_25: true  # access-request include
+  attribute_31:
+    mac_format: "ietf upper-case"
+    send_nas_port_detail: "mac-only"
+
+# RADIUS Server Dead Criteria
+radius_dead_criteria:
+  time: 20
+  tries: 3
+
+radius_deadtime: 5
+
+# 802.1X Global Configuration
+dot1x:
+  system_auth_control: true
+  critical_eapol: true
+
+# Access Session Configuration
+access_session:
+  mac_move: "deny"
+  acl_default: "passthrough"
+
+# Class Maps
+class_maps:
+  - name: CM-DOT1X_FAILED
+    type: "control subscriber"
+    match: "match-all"
+    conditions:
+      - "match method dot1x"
+      - "match result-type method dot1x authoritative"
+
+  - name: CM-DOT1X_NO_RESP
+    type: "control subscriber"
+    match: "match-all"
+    conditions:
+      - "match method dot1x"
+      - "match result-type method dot1x agent-not-found"
+
+  - name: CM-IN_FAILOPEN
+    type: "control subscriber"
+    match: "match-any"
+    conditions:
+      - "match activated-service-template TEMPLATE_FAILOPEN_DATA"
+
+  - name: CM-MAB_FAILED
+    type: "control subscriber"
+    match: "match-all"
+    conditions:
+      - "match method mab"
+      - "match result-type method mab authoritative"
+
+  - name: CM-NOT_IN_FAILOPN
+    type: "control subscriber"
+    match: "match-none"
+    conditions:
+      - "match activated-service-template TEMPLATE_FAILOPEN_DATA"
+
+  - name: CM-SVRDOWN_AUTH
+    type: "control subscriber"
+    match: "match-all"
+    conditions:
+      - "match result-type aaa-timeout"
+      - "match authorization-status authorized"
+
+  - name: CM-SVRDOWN_UNAUTH
+    type: "control subscriber"
+    match: "match-all"
+    conditions:
+      - "match result-type aaa-timeout"
+      - "match authorization-status unauthorized"
+
+  - name: CM-TEST
+    type: "control subscriber"
+    match: "match-all"
+    conditions:
+      - "match method dot1x"
+
+  - name: CM_CLIENT_VOICE
+    type: "control subscriber"
+    match: "match-all"
+    conditions:
+      - "match client-type voice"
+
+# Policy Map Configuration
+policy_map:
+  name: PORT-AUTH-POLICY
+  type: "control subscriber"
+  events:
+    - name: session-started
+      match: "match-all"
+      sequence: 10
+      class: "always"
+      action: "do-until-failure"
+      commands:
+        - seq: 10
+          command: "authenticate using dot1x retries 2 retry-time 7 priority 10"
+
+    - name: authentication-failure
+      match: "match-first"
+      actions:
+        - sequence: 5
+          class: CM-DOT1X_FAILED
+          action: "do-until-failure"
+          commands:
+            - seq: 10
+              command: "terminate dot1x"
+            - seq: 20
+              command: "authenticate using mab priority 20"
+        - sequence: 10
+          class: CM-SVRDOWN_UNAUTH
+          action: "do-until-failure"
+          commands:
+            - seq: 10
+              command: "activate service-template TEMPLATE_FAILOPEN_DATA"
+            - seq: 15
+              command: "activate service-template TEMPLATE_FAILOPEN_VOICE"
+            - seq: 20
+              command: "authorize"
+            - seq: 30
+              command: "pause reauthentication"
+        - sequence: 20
+          class: CM-SVRDOWN_AUTH
+          action: "do-until-failure"
+          commands:
+            - seq: 10
+              command: "pause reauthentication"
+            - seq: 20
+              command: "authorize"
+        - sequence: 30
+          class: CM-DOT1X_NO_RESP
+          action: "do-until-failure"
+          commands:
+            - seq: 10
+              command: "terminate dot1x"
+            - seq: 20
+              command: "authenticate using mab priority 20"
+        - sequence: 40
+          class: CM-MAB_FAILED
+          action: "do-until-failure"
+          commands:
+            - seq: 10
+              command: "terminate mab"
+            - seq: 20
+              command: "authentication-restart 60"
+        - sequence: 60
+          class: "always"
+          action: "do-until-failure"
+          commands:
+            - seq: 10
+              command: "terminate dot1x"
+            - seq: 20
+              command: "terminate mab"
+            - seq: 30
+              command: "authentication-restart 60"
+
+    - name: agent-found
+      match: "match-all"
+      sequence: 10
+      class: "always"
+      action: "do-until-failure"
+      commands:
+        - seq: 10
+          command: "terminate mab"
+        - seq: 20
+          command: "authenticate using dot1x retries 2 retry-time 7 priority 10"
+
+    - name: aaa-available
+      match: "match-all"
+      actions:
+        - sequence: 10
+          class: CM-IN_FAILOPEN
+          action: "do-until-failure"
+          commands:
+            - seq: 10
+              command: "clear-session"
+        - sequence: 20
+          class: CM-NOT_IN_FAILOPN
+          action: "do-until-failure"
+          commands:
+            - seq: 10
+              command: "resume reauthentication"
+
+    - name: inactivity-timeout
+      match: "match-all"
+      sequence: 10
+      class: "always"
+      action: "do-until-failure"
+      commands:
+        - seq: 10
+          command: "clear-session"
+
+    - name: violation
+      match: "match-all"
+      sequence: 10
+      class: "always"
+      action: "do-until-failure"
+      commands:
+        - seq: 10
+          command: "restrict"
+
+    - name: authentication-success
+      match: "match-first"
+      actions:
+        - sequence: 5
+          class: CM_CLIENT_VOICE
+          action: "do-until-failure"
+          commands:
+            - seq: 10
+              command: "activate service-template TEMPLATE_PASS_AUTH_VOICE"
+        - sequence: 10
+          class: "always"
+          action: "do-until-failure"
+          commands:
+            - seq: 10
+              command: "activate service-template TEMPLATE_PASS_AUTH_DATA"
+
+# Service Templates
+service_templates:
+  - name: DEFAULT_LINKSEC_POLICY_MUST_SECURE
+    config:
+      - "linksec policy must-secure"
+
+  - name: DEFAULT_LINKSEC_POLICY_SHOULD_SECURE
+    config:
+      - "linksec policy should-secure"
+
+  - name: DEFAULT_CRITICAL_VOICE_TEMPLATE
+    config:
+      - "voice vlan"
+
+  - name: DEFAULT_CRITICAL_DATA_TEMPLATE
+    config: []
+
+  - name: webauth-global-inactive
+    config:
+      - "inactivity-timer 3600"
+
+  - name: TEMPLATE_PASS_AUTH_DATA
+    config:
+      - "access-group al-fs-full-access-in"
+
+  - name: TEMPLATE_PASS_AUTH_VOICE
+    config:
+      - "access-group al-fs-full-access-in"
+      - "voice vlan"
+
+  - name: TEMPLATE_FAILOPEN_DATA
+    config:
+      - "access-group al-fs-full-access-in"
+
+  - name: TEMPLATE_FAILOPEN_VOICE
+    config:
+      - "access-group al-fs-full-access-in"
+      - "voice vlan"
+
+# Device Tracking Policy
+device_tracking_policy:
+  name: IPDT_POLICY
+  protocol_udp: false
+  tracking_enable: true
+
+# Access Session Attributes
+access_session_attributes:
+  filter_list: "sensor_list"
+  filters:
+    - cdp
+    - lldp
+    - dhcp
+  accounting_filter_spec: "sensor_list"
+
+# Device Sensor Configuration
+device_sensor:
+  filter_lists:
+    dhcp:
+      name: dhcp-list
+      options:
+        - host-name
+        - class-identifier
+        - client-identifier
+
+    lldp:
+      name: lldp-list
+      tlvs:
+        - system-name
+        - system-description
+        - system-capabilities
+
+    cdp:
+      name: cdp-list
+      tlvs:
+        - device-name
+        - address-type
+        - capabilities-type
+        - version-type
+        - platform-type
+
+  filter_specs:
+    - protocol: dhcp
+      action: include
+      list: dhcp-list
+    - protocol: lldp
+      action: include
+      list: lldp-list
+    - protocol: cdp
+      action: include
+      list: cdp-list
+
+  notify_all_changes: true
+
+# Interface Template
+interface_template:
+  name: PORT-AUTH-TEMPLATE
+  config:
+    dot1x:
+      pae: authenticator
+      timeout_tx_period: 7
+    mab: true
+    access_session:
+      host_mode: "multi-domain"
+      control_direction: "in"
+      closed: true
+      port_control: "auto"
+    authentication:
+      periodic: true
+      timer_reauthenticate: 28800
+    service_policy:
+      type: "control subscriber"
+      name: "PORT-AUTH-POLICY"
+
+# Sample Interface Configuration
+sample_interface:
+  name: GigabitEthernet1/0/17
+  description: Workstation
+  access_vlan: 152
+  switchport_mode: access
+  port_security:
+    enabled: true
+    maximum: 3
+    violation: restrict
+    aging_time: 5
+    aging_type: inactivity
+  ip_arp_inspection_rate: 100
+  logging_link_status: false
+  snmp_mac_notification:
+    added: true
+    removed: true
+  storm_control_broadcast: 10.00
+  spanning_tree:
+    portfast: true
+    bpduguard: true
+  ip_verify_source: true
+
+# Access Control Lists
+access_lists:
+  - name: al-fs-full-access-in
+    type: extended
+    entries:
+      - sequence: 10
+        action: permit
+        protocol: ip
+        source: any
+        destination: any
+
+  - name: al-fs-limited-access-in
+    type: extended
+    entries:
+      - sequence: 10
+        action: deny
+        protocol: tcp
+        source: any
+        destination: 10.247.0.0 0.0.63.255
+        dest_ports: [22, 2222, 13000]
+      - sequence: 20
+        action: deny
+        protocol: tcp
+        source: any
+        destination: 10.247.0.0 0.0.15.255
+        dest_ports: [22, 2222, 13000]
+      - sequence: 30
+        action: deny
+        protocol: tcp
+        source: any
+        destination: 10.251.0.0 0.0.63.255
+        dest_ports: [22, 2222, 13000]
+      - sequence: 40
+        action: deny
+        protocol: tcp
+        source: any
+        destination: 10.251.0.0 0.0.15.255
+        dest_ports: [22, 2222, 13000]
+      - sequence: 50
+        action: deny
+        protocol: tcp
+        source: any
+        destination: host 10.243.160.1
+        dest_ports: [22, 2222, 13000]
+      - sequence: 60
+        action: deny
+        protocol: tcp
+        source: any
+        destination: host 10.241.49.1
+        dest_ports: [22, 2222, 13000]
+      - sequence: 70
+        action: deny
+        protocol: tcp
+        source: any
+        destination: 10.220.50.32 0.0.0.3
+        dest_ports: [22, 2222, 13000]
+      - sequence: 80
+        action: permit
+        protocol: ip
+        source: any
+        destination: 10.247.0.0 0.0.63.255
+      - sequence: 90
+        action: permit
+        protocol: ip
+        source: any
+        destination: 10.247.0.0 0.0.15.255
+      - sequence: 100
+        action: permit
+        protocol: ip
+        source: any
+        destination: 10.251.0.0 0.0.63.255
+      - sequence: 110
+        action: permit
+        protocol: ip
+        source: any
+        destination: 10.251.0.0 0.0.15.255
+      - sequence: 120
+        action: permit
+        protocol: ip
+        source: any
+        destination: host 10.243.160.1
+      - sequence: 130
+        action: permit
+        protocol: ip
+        source: any
+        destination: host 10.241.49.1
+      - sequence: 140
+        action: permit
+        protocol: ip
+        source: any
+        destination: 10.220.50.32 0.0.0.3
+      - sequence: 150
+        action: permit
+        protocol: tcp
+        source: any
+        destination: 10.0.0.0 0.255.255.255
+        dest_port_range: [49152, 65525]
+      - sequence: 160
+        action: permit
+        protocol: udp
+        source: any
+        destination: 10.0.0.0 0.255.255.255
+        dest_port_range: [49152, 65525]
+      - sequence: 170
+        action: permit
+        protocol: udp
+        source: any
+        destination: any
+        dest_ports: [67, 68]  # DHCP bootps/bootpc
+      - sequence: 180
+        action: permit
+        protocol: tcp
+        source: any
+        destination: any
+        dest_ports: [67, 68]
+      - sequence: 190
+        action: permit
+        protocol: tcp
+        source: any
+        source_ports: [443, 3000]
+        destination: host 10.227.99.50
+      - sequence: 200
+        action: permit
+        protocol: tcp
+        source: any
+        source_ports: [443, 3000]
+        destination: host 10.227.131.57
+      - sequence: 210
+        action: permit
+        protocol: tcp
+        source: any
+        source_ports: [443, 3000]
+        destination: host 10.227.99.56
+      - sequence: 220
+        action: permit
+        protocol: tcp
+        source: any
+        source_port: 443
+        destination: host 10.227.98.18
+      - sequence: 230
+        action: permit
+        protocol: tcp
+        source: any
+        source_port: 443
+        destination: host 10.227.130.10
+      - sequence: 240
+        action: permit
+        protocol: tcp
+        source: any
+        source_port: 443
+        destination: host 10.227.98.21
+      - sequence: 250
+        action: permit
+        protocol: tcp
+        source: any
+        source_port: 3520
+        destination: host 10.227.99.51
+      - sequence: 260
+        action: permit
+        protocol: tcp
+        source: any
+        source_port: 3520
+        destination: host 10.227.131.58
+      - sequence: 270
+        action: permit
+        protocol: tcp
+        source: any
+        source_port: 3520
+        destination: host 10.227.99.57
+      - sequence: 280
+        action: permit
+        protocol: tcp
+        source: any
+        source_port: 3443
+        destination: host 10.227.99.52
+      - sequence: 290
+        action: permit
+        protocol: tcp
+        source: any
+        source_port: 3520
+        destination: host 10.227.99.53
+      - sequence: 300
+        action: permit
+        protocol: tcp
+        source: any
+        source_port: 443
+        destination: host 10.227.98.19
+      - sequence: 310
+        action: permit
+        protocol: tcp
+        source: any
+        source_ports: [5985, 5986]
+        destination: 10.13.0.0 0.0.255.255
+      - sequence: 320
+        action: permit
+        protocol: tcp
+        source: any
+        source_ports: [5985, 5986]
+        destination: 10.46.162.0 0.0.0.255
+      - sequence: 330
+        action: deny
+        protocol: ip
+        source: any
+        destination: any
+
+# expected:
+
+#   # ========================================================================
+#   # DEVICE INFORMATION
+#   # ========================================================================
+
+#   os_version_regex: "^17\\."
+#   model_any_of:
+#     - C9300-48UXM
+#     - C9500-32QC
+  
+#   must_have_hostname: cticblrm6ncas01-cp94
+  
+#   must_have_interfaces:
+#     - Loopback0
+#     - Loopback1
+#     - GigabitEthernet1/0/1
+#     - TenGigabitEthernet1/0/25
+#     - FortyGigabitEthernet5/0/9
+#     - FortyGigabitEthernet6/0/9
+#     - Vlan160
+#     - Vlan161
+#     - Vlan416
+#     - Vlan846
+#     - Vlan933
+#     - Vlan956
+
+#   # ========================================================================
+#   # MINIMUM VERSION REQUIREMENTS
+#   # ========================================================================
+
+#   min_iosxe_version: "17.9.0"
+
+#   # ========================================================================
+#   # SECURITY BASELINE REQUIREMENTS
+#   # ========================================================================
+
+#   require_aaa_new_model: true
+#   forbid_enable_password_7: true
+#   require_http_server_disabled: true
+#   ssh_only_on_vty: true
+#   require_ntp_auth: true
+#   require_remote_syslog: true
+#   forbid_rw_snmp_communities: true
+#   allow_snmp_only_with_acl: true
+#   require_banner_login: true
+#   require_login_tracking: true
+#   forbid_crypto_compliance_shield_disable: true
+
+#   # ========================================================================
+#   # COMPLIANCE WAIVERS (All False = Full Compliance)
+#   # ========================================================================
+
+#   compliance_waive_aaa_new_model: false
+#   compliance_waive_snmp: false
+#   compliance_waive_enable_pw7: false
+#   compliance_waive_min_iosxe: false
+#   compliance_waive_snmp_acl: false
+#   compliance_waive_crypto_shield: false
+
+#   # ========================================================================
+#   # RADIUS CONFIGURATION
+#   # ========================================================================
+
+#   radius:
+#     # ForeScout RADIUS VIP Servers
+#     servers:
+#       - 10.220.50.33
+#       - 10.220.50.34
+    
+#     # RADIUS Group Name
+#     group_name: "FORESCOUT"
+    
+#     # Authentication and Accounting Ports
+#     auth_port: 1812
+#     acct_port: 1813
+    
+#     # Server Timeout Settings
+#     timeout: 5
+#     deadtime: 5
+    
+#     # Source Interface for RADIUS Communications
+#     source_interface: "Loopback0"
+    
+#     # Required RADIUS Attributes for NAC/ISE Integration
+#     required_attributes:
+#       - "attribute 6 on-for-login-auth"
+#       - "attribute 8 include-in-access-req"
+#       - "attribute 25 access-request include"
+#       - "attribute 31 mac format ietf upper-case"
+#       - "attribute 32 include-in-access-req"
+    
+#     # Dynamic Authorization (CoA) Clients for Enforcement
+#     coa_clients:
+#       - 10.220.50.33
+#       - 10.220.50.34
+    
+#     # Server Dead Criteria (Failover Protection)
+#     dead_criteria_time: 20
+#     dead_criteria_tries: 3
+
+#   # ========================================================================
+#   # AAA CONFIGURATION
+#   # ========================================================================
+
+#   aaa:
+#     # 802.1X Authentication Method List
+#     # Expected: "aaa authentication dot1x default group FORESCOUT"
+#     authn_dot1x_regex: "group FORESCOUT$"
+    
+#     # Network Authorization Method List (Access-Accept/Reject)
+#     # Expected: "aaa authorization network default group FORESCOUT"
+#     require_authorization_network: true
+#     authz_network_regex: "group FORESCOUT$"
+    
+#     # Network Accounting (Start-Stop Session Tracking)
+#     # Expected: "aaa accounting network default start-stop group FORESCOUT"
+#     require_accounting_network: true
+#     acct_network_regex: "start-stop group FORESCOUT$"
+    
+#     # AAA Server Dead Criteria (Failover Settings)
+#     dead_criteria_time: 20
+#     dead_criteria_tries: 3
+
+#   # ========================================================================
+#   # 802.1X GLOBAL CONFIGURATION
+#   # ========================================================================
+
+#   dot1x:
+#     # System Authentication Control
+#     require_system_auth_control: true
+    
+#     # Critical EAPOL Handling (for voice/priority traffic)
+#     require_critical_eapol: true
+    
+#     # MAC Authentication Bypass Settings
+#     require_mab: true
+    
+#     # Access Session Configuration
+#     require_access_session_mac_move_deny: true
+#     require_access_session_acl_default_passthrough: true
+#     require_access_session_closed_on_port: true
+#     require_access_session_control_direction_in: true
+#     require_access_session_host_mode_multi_domain: true
+    
+#     # Per-Interface Requirements (for all access ports)
+#     require_pae_authenticator: true
+#     require_port_control_auto: true
+#     require_auth_order: true
+#     require_periodic_reauth: true
+#     require_host_mode_multi_domain: true
+#     require_device_tracking: true
+    
+
+
+#   # ========================================================================
+#   # CLASS MAPS FOR POLICY (Control Subscriber)
+#   # ========================================================================
+
+#   class_maps:
+#     required_class_maps:
+#       - name: "CM-DOT1X_FAILED"
+#         type: "control subscriber"
+#         match_type: "match-all"
+#         criteria:
+#           - "method dot1x"
+#           - "result-type method dot1x authoritative"
+      
+#       - name: "CM-DOT1X_NO_RESP"
+#         type: "control subscriber"
+#         match_type: "match-all"
+#         criteria:
+#           - "method dot1x"
+#           - "result-type method dot1x agent-not-found"
+      
+#       - name: "CM-MAB_FAILED"
+#         type: "control subscriber"
+#         match_type: "match-all"
+#         criteria:
+#           - "method mab"
+#           - "result-type method mab authoritative"
+      
+#       - name: "CM-TEST"
+#         type: "control subscriber"
+#         match_type: "match-all"
+#         criteria:
+#           - "method dot1x"
+      
+#       - name: "CM-IN_FAILOPEN"
+#         type: "control subscriber"
+#         match_type: "match-any"
+#         criteria:
+#           - "activated-service-template TEMPLATE_FAILOPEN_DATA"
+      
+#       - name: "CM-NOT_IN_FAILOPN"
+#         type: "control subscriber"
+#         match_type: "match-none"
+#         criteria:
+#           - "activated-service-template TEMPLATE_FAILOPEN_DATA"
+      
+#       - name: "CM-SVRDOWN_AUTH"
+#         type: "control subscriber"
+#         match_type: "match-all"
+#         criteria:
+#           - "result-type aaa-timeout"
+#           - "authorization-status authorized"
+      
+#       - name: "CM-SVRDOWN_UNAUTH"
+#         type: "control subscriber"
+#         match_type: "match-all"
+#         criteria:
+#           - "result-type aaa-timeout"
+#           - "authorization-status unauthorized"
+      
+#       - name: "CM_CLIENT_VOICE"
+#         type: "control subscriber"
+#         match_type: "match-all"
+#         criteria:
+#           - "client-type voice"
+
+#   # ========================================================================
+#   # POLICY MAPS FOR AUTHENTICATION FLOW
+#   # ========================================================================
+
+#   policy_maps:
+#     required_policy_maps:
+#       - name: "PORT-AUTH-POLICY"
+#         type: "control subscriber"
+#         description: "Main 802.1X/MAB authentication and authorization policy"
+#         required_events:
+#           - "session-started"
+#           - "authentication-failure"
+#           - "authentication-success"
+#           - "agent-found"
+#           - "aaa-available"
+#           - "inactivity-timeout"
+#           - "violation"
+
+#   # ========================================================================
+#   # SERVICE TEMPLATES FOR ACCESS CONTROL
+#   # ========================================================================
+
+#   service_templates:
+#     required_templates:
+#       - name: "TEMPLATE_PASS_AUTH_DATA"
+#         description: "Full access for authenticated data devices"
+#         access_group: "al-fs-full-access-in"
+      
+#       - name: "TEMPLATE_PASS_AUTH_VOICE"
+#         description: "Full access for authenticated voice devices"
+#         access_group: "al-fs-full-access-in"
+#         voice_vlan: true
+      
+#       - name: "TEMPLATE_FAILOPEN_DATA"
+#         description: "Limited access during server failure (data)"
+#         access_group: "al-fs-limited-access-in"
+      
+#       - name: "TEMPLATE_FAILOPEN_VOICE"
+#         description: "Limited access during server failure (voice)"
+#         access_group: "al-fs-limited-access-in"
+#         voice_vlan: true
+
+#   # ========================================================================
+#   # ACCESS CONTROL LISTS (Traffic Policies)
+#   # ========================================================================
+
+#   access_lists:
+#     required_acls:
+#       - name: "al-fs-full-access-in"
+#         type: "extended"
+#         description: "Full access for authenticated devices"
+#         expected_content: "permit ip any any"
+      
+#       - name: "al-fs-limited-access-in"
+#         type: "extended"
+#         description: "Restricted access during server failure"
+#         critical_services: ["DNS", "DHCP", "NTP", "Domain Services", "Directory Services"]
+      
+#       - name: "al-fs-quarantined-access-in"
+#         type: "extended"
+#         description: "Quarantine network access"
+      
+#       - name: "al-blrm-WirelessAP-in"
+#         type: "extended"
+#         description: "Wireless AP Inbound - VLAN 846"
+#         expected_rules:
+#           - "permit DHCP"
+#           - "permit SSH (22)"
+#           - "permit CAPWAP (UDP 5246, 5247)"
+      
+#       - name: "al-blrm-WirelessAP-out"
+#         type: "extended"
+#         description: "Wireless AP Outbound - VLAN 846"
+
+#   # ========================================================================
+#   # DEVICE TRACKING POLICY
+#   # ========================================================================
+
+#   device_tracking:
+#     policy_name: "IPDT_POLICY"
+#     description: "Device identity tracking for 802.1X endpoints"
+    
+#     # Sensors Enabled
+#     sensors_enabled:
+#       - "cdp"
+#       - "lldp"
+#       - "dhcp"
+    
+#     # Tracking Configuration
+#     tracking_enabled: true
+#     protocol_filters:
+#       udp: false
+    
+#     # Filter Lists
+#     cdp_filter_list:
+#       - "device-name"
+#       - "address-type"
+#       - "capabilities-type"
+#       - "version-type"
+#       - "platform-type"
+    
+#     lldp_filter_list:
+#       - "system-name"
+#       - "system-description"
+#       - "system-capabilities"
+    
+#     dhcp_filter_list:
+#       - "host-name"
+#       - "class-identifier"
+#       - "client-identifier"
+  
+#  # ===================================================================================
+#   # Interface Descriptions - Ansible Role Variables
+#   # Only descriptions are defined here, interfaces will be gathered from the device
+#  # ====================================================================================
+#   dot1x_keywords:
+#     - test-aaa
+
+
+#   # ========================================================================
+#   # SECURITY - SSH CONFIGURATION
+#   # ========================================================================
+
+#   ssh:
+#     version: 2
+#     timeout: 30
+#     source_interface: "Loopback0"
+#     vty_access_list: 22
+
+#   # ========================================================================
+#   # NTP CONFIGURATION
+#   # ========================================================================
+
+#   ntp:
+#     require_authentication: true
+#     authentication_key: 10
+#     auth_algorithm: "md5"
+#     servers:
+#       - address: "10.220.0.1"
+#         key: 10
+#         prefer: true
+#       - address: "10.220.0.2"
+#         key: 10
+#         prefer: false
+#     source_interface: "Loopback0"
+
+#   # ========================================================================
+#   # SYSLOG CONFIGURATION
+#   # ========================================================================
+
+#   syslog:
+#     require_remote: true
+#     source_interface: "Loopback0"
+#     servers:
+#       - "10.44.127.38"
+#     origin_id: "hostname"
+#     buffering: 64000
+
+#   # ========================================================================
+#   # SNMP CONFIGURATION
+#   # ========================================================================
+
+#   snmp:
+#     require_access_lists: true
+#     required_acls:
+#       - 40
+#       - 49
+#     forbid_rw_communities: true
+#     trap_source: "Loopback0"
+#     views:
+#       - "view_all"
+#       - "WanderCloud"
+#     groups:
+#       - name: "network-admin"
+#         version: "v3"
+#         priv: true
+#         acl: 49
+#       - name: "network-operator"
+#         version: "v3"
+#         priv: true
+#         acl: 49
+
+#   # ========================================================================
+#   # BANNERS
+#   # ========================================================================
+
+#   banners:
+#     login: true
+#     exec: true
+
+#   # ========================================================================
+#   # LOGIN TRACKING
+#   # ========================================================================
+
+#   login_tracking:
+#     on_failure: true
+#     on_success: true
+#     session_timeout: 10
+
+#   # ========================================================================
+#   # ENCRYPTION & COMPLIANCE SHIELD
+#   # ========================================================================
+
+#   crypto:
+#     compliance_shield: "enabled"
+#     password_encryption: true
+#     enable_secret_type: "9"  # No type 7 passwords
+
+#   # ========================================================================
+#   # SPANNING TREE SETTINGS
+#   # ========================================================================
+
+#   spanning_tree:
+#     mode: "rapid-pvst"
+#     loopguard_default: true
+#     portfast_bpduguard_default: true
+#     portfast_bpdufilter_default: true
+#     uplinkfast: true
+
+#   # ========================================================================
+#   # ERROR DISABLE RECOVERY
+#   # ========================================================================
+
+#   errdisable:
+#     recovery_enabled: true
+#     causes:
+#       - "udld"
+#       - "bpduguard"
+#       - "channel-misconfig"
+#       - "link-flap"
+#       - "psecure-violation"
+#       - "storm-control"
+#       - "arp-inspection"
+
+#   # ========================================================================
+#   # PORT SECURITY
+#   # ========================================================================
+
+#   port_security:
+#     # Standard Access Port
+#     access_port:
+#       maximum: 3
+#       violation: "restrict"
+#       aging_time: 5
+#       aging_type: "inactivity"
+    
+#     # Camera/WAP Port (10GE 25-48, lower storm control)
+#     camera_port:
+#       maximum: 3
+#       violation: "restrict"
+#       storm_control_broadcast: "5.00"
+    
+#     # Display Port (GE/10GE 45-48, even lower storm control)
+#     display_port:
+#       maximum: 3
+#       violation: "restrict"
+#       aging_time: 1
+#       storm_control_broadcast: "0.20"
+    
+#     # Default
+#     default:
+#       storm_control_broadcast: "10.00"
+
+#   # ========================================================================
+#   # DHCP SNOOPING & ARP INSPECTION
+#   # ========================================================================
+
+#   dhcp_snooping:
+#     enabled: true
+#     vlans: [160, 161, 416, 846, 933, 956]
+
+#   arp_inspection:
+#     enabled: true
+#     vlans: [160, 161, 416, 846, 933, 956]
+
+#   # ========================================================================
+#   # VLAN CONFIGURATION
+#   # ========================================================================
+
+#   vlans:
+#     - id: 151
+#       name: "printer-vlan"
+#     - id: 160
+#       name: "floor_06n-data-160"
+#     - id: 161
+#       name: "floor_06n-data-161"
+#     - id: 316
+#       name: "floor-bwa-data"
+#     - id: 416
+#       name: "floor_06n-voice-416"
+#     - id: 616
+#       name: "floor_06n-bwa-voice-616"
+#     - id: 846
+#       name: "floor_06n-ap-846"
+#     - id: 933
+#       name: "floor_06n-cardax-933"
+#     - id: 956
+#       name: "floor_06n-display-956"
+#     - id: 991
+#       name: "other-native-991"
+#     - id: 998
+#       name: "other-unused-998"

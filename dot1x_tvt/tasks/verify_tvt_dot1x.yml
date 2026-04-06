@@ -1,0 +1,387 @@
+---
+# ===============================================
+# DOT1X Technical Verification Test - Simplified with Waiver Support
+# ===============================================
+# This playbook validates dot1x configuration on Cisco IOS devices
+# Tests: Global dot1x settings, RADIUS servers, AAA config, and interface settings
+# Supports compliance waivers for lab/staging environments
+
+# Gather device facts and configuration
+- name: Gather IOS device facts
+  cisco.ios.ios_facts:
+    gather_subset: all
+
+# Verify running config is available
+- name: Ensure running-config is available
+  assert:
+    that:
+      - ansible_net_config is defined
+    fail_msg: "Device configuration not available - facts gathering failed"
+
+# Load test expectations from variables
+- name: Load common expectations
+  include_vars: "{{ playbook_dir }}/../group_vars/all.yml"
+
+- name: Load dot1x expectations
+  include_vars: "{{ playbook_dir }}/../group_vars/npoc_switches_baseline.yml"
+
+# Set convenience variables for easier testing
+- name: Set test variables
+  ansible.builtin.set_fact:
+    device_config: "{{ ansible_net_config | regex_replace('\\r','') }}"
+
+# ===============================================
+# GLOBAL DOT1X CONFIGURATION TESTS
+# ===============================================
+
+# Test 1: Verify AAA new-model is configured
+- name: Test - AAA new-model configuration
+  vars:
+    config_present: "{{ device_config is search('(?m)^aaa new-model$') }}"
+    waived: "{{ expected.get('compliance_waive_aaa_new_model', false) | bool }}"
+  ansible.builtin.assert:
+    that: config_present or waived
+    success_msg: "{{ '✓ AAA new-model is configured' if config_present else '✗ FAILED - AAA new-model is missing BUT WAIVED' }}"
+    fail_msg: "✗ FAILED - AAA new-model is missing - required for dot1x"
+  failed_when: not config_present and not waived
+  when: expected.get('require_aaa_new_model', true)
+
+# Test 2: Verify dot1x system-auth-control is enabled
+- name: Test - dot1x system-auth-control configuration
+  vars:
+    config_present: "{{ device_config is search('(?m)^dot1x system-auth-control$') }}"
+    waived: "{{ expected.dot1x.get('compliance_waive_global', false) | bool }}"
+    waiver_reason: "{{ expected.dot1x.get('waiver_reason_global', '') }}"
+  ansible.builtin.assert:
+    that: config_present or waived
+    success_msg: "{{ '✓ dot1x system-auth-control is enabled' if config_present else '✗ FAILED - dot1x system-auth-control is missing BUT WAIVED: ' + waiver_reason }}"
+    fail_msg: "✗ FAILED - dot1x system-auth-control is missing - required for dot1x operation"
+  failed_when: not config_present and not waived
+  when: expected.dot1x.get('require_system_auth_control', true)
+
+# ===============================================
+# RADIUS SERVER CONFIGURATION TESTS
+# ===============================================
+
+# Extract configured RADIUS server IPs from config
+- name: Extract RADIUS server IPs from configuration
+  ansible.builtin.set_fact:
+    # Modern radius server syntax
+    radius_servers_new: "{{ device_config | regex_findall('(?ms)^radius server \\S+\\n(?:.*\\n)*?^ address ipv4 (\\d+\\.\\d+\\.\\d+\\.\\d+)') }}"
+    # Legacy radius-server host syntax  
+    radius_servers_legacy: "{{ device_config | regex_findall('(?mi)^radius-server\\s+host\\s+(\\d+\\.\\d+\\.\\d+\\.\\d+)') }}"
+
+# Test 3: Verify required RADIUS servers are configured
+- name: Test - Required RADIUS servers configuration
+  vars:
+    required_servers: "{{ expected.radius.get('servers', []) }}"
+    configured_servers: "{{ (radius_servers_new + radius_servers_legacy) | unique }}"
+    missing_servers: "{{ required_servers | difference(configured_servers) }}"
+    waived: "{{ expected.radius.get('compliance_waive_servers', false) | bool }}"
+    waiver_reason: "{{ expected.radius.get('radius_servers_reason', '') }}"
+    servers_compliant: "{{ missing_servers | length == 0 }}"
+  ansible.builtin.assert:
+    that: servers_compliant or waived
+    success_msg: "{{ '✓ All required RADIUS servers are configured: ' + (required_servers | string) if servers_compliant else '✗ FAILED - Missing RADIUS servers: ' + (missing_servers | string) + ' BUT WAIVED: ' + waiver_reason }}"
+    fail_msg: "✗ FAILED - Missing RADIUS servers: {{ missing_servers }}. Found: {{ configured_servers }}"
+  failed_when: not servers_compliant and not waived
+  when: 
+    - required_servers | length > 0
+
+# Test 4: Verify AAA group server radius exists (optional)
+- name: Test - AAA group server radius configuration
+  vars:
+    group_name: "{{ expected.radius.get('group_name', '') }}"
+    config_present: "{{ (group_name | length == 0) or (device_config is search('(?mi)^aaa\\s+group\\s+server\\s+radius\\s+' + group_name + '\\b')) }}"
+    waived: "{{ expected.radius.get('compliance_waive_group', false) | bool }}"
+  ansible.builtin.assert:
+    that: config_present or waived
+    success_msg: "{{ '✓ AAA radius group \"' + group_name + '\" is configured' if config_present else '✗ FAILED - AAA radius group \"' + group_name + '\" is missing BUT WAIVED' }}"
+    fail_msg: "✗ FAILED - AAA radius group '{{ group_name }}' is missing"
+  failed_when: not config_present and not waived
+  when: group_name | length > 0
+
+# ===============================================
+# AAA METHOD LISTS TESTS
+# ===============================================
+
+# Test 5: Verify AAA authentication dot1x method list
+- name: Test - AAA authentication dot1x method list
+  vars:
+    auth_regex: "{{ '^aaa authentication dot1x default ' + expected.aaa.get('authn_dot1x_regex', 'group \\\\S+(?: local)?$') }}"
+    config_present: "{{ device_config is search(auth_regex, multiline=True, ignorecase=True) }}"
+    waived: "{{ expected.aaa.get('compliance_waive_authn', false) | bool }}"
+  ansible.builtin.assert:
+    that: config_present or waived
+    success_msg: "{{ '✓ AAA dot1x authentication method list is configured correctly' if config_present else '✗ FAILED - AAA dot1x authentication method list missing/incorrect BUT WAIVED' }}"
+    fail_msg: "✗ FAILED - AAA dot1x authentication method list missing or incorrect. Expected regex: {{ auth_regex }}"
+  failed_when: not config_present and not waived
+
+# Test 6: Verify AAA authorization network (if required)
+- name: Test - AAA authorization network configuration
+  vars:
+    authz_regex: "{{ '^aaa authorization network default ' + expected.aaa.get('authz_network_regex', 'group \\\\S+$') }}"
+    config_present: "{{ device_config is search(authz_regex, multiline=True, ignorecase=True) }}"
+    waived: "{{ expected.aaa.get('compliance_waive_authz', false) | bool }}"
+  ansible.builtin.assert:
+    that: config_present or waived
+    success_msg: "{{ '✓ AAA authorization network is configured' if config_present else '✗ FAILED - AAA authorization network missing/incorrect BUT WAIVED' }}"
+    fail_msg: "✗ FAILED - AAA authorization network missing or incorrect. Expected regex: {{ authz_regex }}"
+  failed_when: not config_present and not waived
+  when: expected.aaa.get('require_authorization_network', false)
+
+# Test 7: Verify AAA accounting dot1x (if required)
+- name: Test - AAA accounting dot1x configuration
+  vars:
+    group_name: "{{ expected.radius.get('group_name', '\\\\S+') }}"
+    acct_regex: "{{ '^aaa accounting dot1x default start-stop group ' + group_name + '$' }}"
+    config_present: "{{ device_config is search(acct_regex, multiline=True, ignorecase=True) }}"
+    waived: "{{ expected.aaa.get('compliance_waive_acct', false) | bool }}"
+  ansible.builtin.assert:
+    that: config_present or waived
+    success_msg: "{{ '✓ AAA accounting dot1x is configured' if config_present else '✗ FAILED - AAA accounting dot1x missing/incorrect BUT WAIVED' }}"
+    fail_msg: "✗ FAILED - AAA accounting dot1x missing or incorrect. Expected regex: {{ acct_regex }}"
+  failed_when: not config_present and not waived
+  when: expected.aaa.get('require_accounting_dot1x', false)
+
+# ===============================================
+# INTERFACE DOT1X CONFIGURATION TESTS - SIMPLIFIED
+# ===============================================
+
+# Show interface configuration status for each interface
+- name: "Interface {{ item }} - Configuration Check"
+  vars:
+    # Extract this interface's configuration block
+    interface_regex: "(?ms)^interface {{ item | regex_escape }}\\b.*?(?=^interface|\\Z)"
+    interface_config: "{{ device_config | regex_findall(interface_regex) | first | default('') }}"
+    
+    # Define required commands based on policy
+    required_commands:
+      - name: "authentication port-control auto"
+        present: "{{ interface_config is search('authentication port-control auto') }}"
+        required: "{{ expected.dot1x.get('require_port_control_auto', true) }}"
+      - name: "dot1x pae authenticator"
+        present: "{{ interface_config is search('dot1x pae authenticator') }}"
+        required: "{{ expected.dot1x.get('require_pae_authenticator', true) }}"
+      - name: "mab"
+        present: "{{ interface_config is search(' mab$', multiline=True) }}"
+        required: "{{ expected.dot1x.get('require_mab', true) }}"
+      - name: "authentication order"
+        present: "{{ interface_config is search('authentication order') }}"
+        required: "{{ expected.dot1x.get('require_auth_order', true) }}"
+      - name: "authentication periodic"
+        present: "{{ interface_config is search('authentication periodic') }}"
+        required: "{{ expected.dot1x.get('require_periodic', true) }}"
+      - name: "authentication event fail action next-method"
+        present: "{{ interface_config is search('authentication event fail action next-method') }}"
+        required: "{{ expected.dot1x.get('require_event_fail_next', true) }}"
+    
+    # Calculate missing required commands
+    missing_commands: "{{ required_commands | selectattr('required') | rejectattr('present') | map(attribute='name') | list }}"
+    interface_compliant: "{{ missing_commands | length == 0 }}"
+    waived: "{{ expected.dot1x.get('compliance_waive_interfaces', false) | bool }}"
+    
+  ansible.builtin.debug:
+    msg:
+      - "Interface: {{ item }}"
+      - "Status: {{ 'COMPLIANT' if interface_compliant else 'NON-COMPLIANT' }}{{ ' (WAIVED)' if (not interface_compliant and waived) else '' }}"
+      - "Missing commands: {{ missing_commands if missing_commands else 'None' }}"
+  loop: "{{ expected.dot1x.target_interfaces }}"
+  loop_control:
+    label: "{{ item }}"
+  when: expected.dot1x.target_interfaces | length > 0
+
+# Show detailed non-compliance information for waived failures
+- name: "Interface {{ item }} - DETAILED NON-COMPLIANCE (WAIVED)"
+  vars:
+    # Extract this interface's configuration block
+    interface_regex: "(?ms)^interface {{ item | regex_escape }}\\b.*?(?=^interface|\\Z)"
+    interface_config: "{{ device_config | regex_findall(interface_regex) | first | default('') }}"
+    
+    # Define required commands based on policy
+    required_commands:
+      - name: "authentication port-control auto"
+        present: "{{ interface_config is search('authentication port-control auto') }}"
+        required: "{{ expected.dot1x.get('require_port_control_auto', true) }}"
+      - name: "dot1x pae authenticator"
+        present: "{{ interface_config is search('dot1x pae authenticator') }}"
+        required: "{{ expected.dot1x.get('require_pae_authenticator', true) }}"
+      - name: "mab"
+        present: "{{ interface_config is search(' mab$', multiline=True) }}"
+        required: "{{ expected.dot1x.get('require_mab', true) }}"
+      - name: "authentication order"
+        present: "{{ interface_config is search('authentication order') }}"
+        required: "{{ expected.dot1x.get('require_auth_order', true) }}"
+      - name: "authentication periodic"
+        present: "{{ interface_config is search('authentication periodic') }}"
+        required: "{{ expected.dot1x.get('require_periodic', true) }}"
+      - name: "authentication event fail action next-method"
+        present: "{{ interface_config is search('authentication event fail action next-method') }}"
+        required: "{{ expected.dot1x.get('require_event_fail_next', true) }}"
+    
+    # Calculate missing required commands
+    missing_commands: "{{ required_commands | selectattr('required') | rejectattr('present') | map(attribute='name') | list }}"
+    interface_compliant: "{{ missing_commands | length == 0 }}"
+    waived: "{{ expected.dot1x.get('compliance_waive_interfaces', false) | bool }}"
+    
+  ansible.builtin.debug:
+    msg:
+      - "🚨 COMPLIANCE FAILURE DETECTED - BUT WAIVED 🚨"
+      - "Interface: {{ item }}"
+      - "Compliance Status: FAILED"
+      - "Waiver Status: ACTIVE (Failure ignored by policy)"
+      - ""
+      - "MISSING DOT1X CONFIGURATION:"
+      - "{{ missing_commands | map('regex_replace', '^(.*)$', '  ❌ \\1') | list }}"
+      - ""
+      - "EXPECTED CONFIGURATION COMMANDS:"
+      - "{{ missing_commands | map('regex_replace', '^(.*)$', '  interface {{ item }}') | list if missing_commands | length == 0 else ['  interface ' + item] + (missing_commands | map('regex_replace', '^(.*)$', '   \\1') | list) + ['  exit'] }}"
+      - ""
+      - "NOTE: This interface will PASS compliance due to active waiver"
+  when: 
+    - not interface_compliant
+    - waived
+  loop: "{{ expected.dot1x.target_interfaces }}"
+  loop_control:
+    label: "{{ item }}"
+
+# Test interface compliance with assertions (always pass when waived)
+- name: "Test - Interface {{ item }} dot1x compliance"
+  vars:
+    # Extract this interface's configuration block
+    interface_regex: "(?ms)^interface {{ item | regex_escape }}\\b.*?(?=^interface|\\Z)"
+    interface_config: "{{ device_config | regex_findall(interface_regex) | first | default('') }}"
+    
+    # Define required commands based on policy
+    required_commands:
+      - name: "authentication port-control auto"
+        present: "{{ interface_config is search('authentication port-control auto') }}"
+        required: "{{ expected.dot1x.get('require_port_control_auto', true) }}"
+      - name: "dot1x pae authenticator"
+        present: "{{ interface_config is search('dot1x pae authenticator') }}"
+        required: "{{ expected.dot1x.get('require_pae_authenticator', true) }}"
+      - name: "mab"
+        present: "{{ interface_config is search(' mab$', multiline=True) }}"
+        required: "{{ expected.dot1x.get('require_mab', true) }}"
+      - name: "authentication order"
+        present: "{{ interface_config is search('authentication order') }}"
+        required: "{{ expected.dot1x.get('require_auth_order', true) }}"
+      - name: "authentication periodic"
+        present: "{{ interface_config is search('authentication periodic') }}"
+        required: "{{ expected.dot1x.get('require_periodic', true) }}"
+      - name: "authentication event fail action next-method"
+        present: "{{ interface_config is search('authentication event fail action next-method') }}"
+        required: "{{ expected.dot1x.get('require_event_fail_next', true) }}"
+    
+    # Calculate missing required commands
+    missing_commands: "{{ required_commands | selectattr('required') | rejectattr('present') | map(attribute='name') | list }}"
+    interface_compliant: "{{ missing_commands | length == 0 }}"
+    waived: "{{ expected.dot1x.get('compliance_waive_interfaces', false) | bool }}"
+    
+  ansible.builtin.assert:
+    that: interface_compliant or waived
+    success_msg: |
+      {% if interface_compliant %}
+      ✅ Interface {{ item }} is COMPLIANT - All required dot1x commands present
+      {% else %}
+      ⚠️ Interface {{ item }} FAILED COMPLIANCE but WAIVED - Missing {{ missing_commands | length }} command(s): {{ missing_commands | join(', ') }}
+      {% endif %}
+    fail_msg: "❌ FAILED - Interface {{ item }} missing: {{ missing_commands | join(', ') }} - WAIVER NOT ACTIVE"
+  failed_when: not interface_compliant and not waived
+  loop: "{{ expected.dot1x.target_interfaces }}"
+  loop_control:
+    label: "{{ item }}"
+  when: expected.dot1x.target_interfaces | length > 0
+
+# Summary of interface test results
+- name: Calculate interface compliance statistics
+  ansible.builtin.set_fact:
+    interface_stats: |
+      {%- set compliant = [] -%}
+      {%- set non_compliant = [] -%}
+      {%- for interface in expected.dot1x.target_interfaces -%}
+        {%- set interface_regex = "(?ms)^interface " + (interface | regex_escape) + "\\b.*?(?=^interface|\\Z)" -%}
+        {%- set interface_config = device_config | regex_findall(interface_regex) | first | default('') -%}
+        {%- set required_checks = [
+          (not expected.dot1x.get('require_port_control_auto', true)) or (interface_config is search('authentication port-control auto')),
+          (not expected.dot1x.get('require_pae_authenticator', true)) or (interface_config is search('dot1x pae authenticator')),
+          (not expected.dot1x.get('require_mab', true)) or (interface_config is search(' mab$', multiline=True)),
+          (not expected.dot1x.get('require_auth_order', true)) or (interface_config is search('authentication order')),
+          (not expected.dot1x.get('require_periodic', true)) or (interface_config is search('authentication periodic')),
+          (not expected.dot1x.get('require_event_fail_next', true)) or (interface_config is search('authentication event fail action next-method'))
+        ] -%}
+        {%- if required_checks | reject | list | length == 0 -%}
+          {%- set _ = compliant.append(interface) -%}
+        {%- else -%}
+          {%- set _ = non_compliant.append(interface) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ {'compliant': compliant, 'non_compliant': non_compliant} | to_json }}
+  when: expected.dot1x.target_interfaces | length > 0
+
+- name: Display interface compliance summary
+  vars:
+    total_interfaces: "{{ expected.dot1x.target_interfaces | length }}"
+    waived: "{{ expected.dot1x.get('compliance_waive_interfaces', false) | bool }}"
+  ansible.builtin.debug:
+    msg:
+      - "=== INTERFACE DOT1X COMPLIANCE SUMMARY ==="
+      - "Total interfaces tested: {{ total_interfaces }}"
+      - "Compliant interfaces: {{ (interface_stats | from_json).compliant | length }}"
+      - "Non-compliant interfaces: {{ (interface_stats | from_json).non_compliant | length }}"
+      - "{% if (interface_stats | from_json).compliant | length > 0 %}✅ Compliant: {{ (interface_stats | from_json).compliant | join(', ') }}{% endif %}"
+      - "{% if (interface_stats | from_json).non_compliant | length > 0 %}{% if waived %}⚠️ Non-compliant (WAIVED): {{ (interface_stats | from_json).non_compliant | join(', ') }}{% else %}❌ Non-compliant (FAILED): {{ (interface_stats | from_json).non_compliant | join(', ') }}{% endif %}{% endif %}"
+      - "Overall Test Result: {{ 'PASS' if ((interface_stats | from_json).non_compliant | length == 0 or waived) else 'FAIL' }}"
+      - "{% if waived and (interface_stats | from_json).non_compliant | length > 0 %}Waiver Reason: Interface compliance waiver is active in policy{% endif %}"
+  when: expected.dot1x.target_interfaces | length > 0
+
+# Test 9: Verify optional global dot1x timers
+- name: Test - Global dot1x timers configuration
+  vars:
+    timer_config: "{{ expected.dot1x.get('global_timers', {}) }}"
+    timer_checks:
+      - key: "quiet_period"
+        regex: "{{ '^dot1x timeout quiet-period ' + (timer_config.quiet_period | string) + '$' }}"
+      - key: "tx_period"  
+        regex: "{{ '^dot1x timeout tx-period ' + (timer_config.tx_period | string) + '$' }}"
+      - key: "max_req"
+        regex: "{{ '^dot1x timeout max-req ' + (timer_config.max_req | string) + '$' }}"
+    
+    # Only check timers that are defined in the config
+    defined_timers: "{{ timer_checks | selectattr('key', 'in', timer_config.keys()) | list }}"
+    missing_timers: "{{ defined_timers | rejectattr('regex', 'search', device_config, ignorecase=True, multiline=True) | map(attribute='key') | list }}"
+    timers_compliant: "{{ missing_timers | length == 0 }}"
+    waived: "{{ expected.dot1x.get('compliance_waive_timers', false) | bool }}"
+    
+  ansible.builtin.assert:
+    that: timers_compliant or waived
+    success_msg: "{{ '✓ Global dot1x timers match policy' if timers_compliant else '✗ FAILED - Global dot1x timers missing/incorrect for: ' + (missing_timers | string) + ' BUT WAIVED' }}"
+    fail_msg: "✗ FAILED - dot1x timers missing/incorrect for: {{ missing_timers }}"
+  failed_when: not timers_compliant and not waived
+  when: 
+    - timer_config | length > 0
+    - timer_config.values() | reject('none') | list | length > 0
+
+# ===============================================
+# TEST SUMMARY
+# ===============================================
+
+# Display test summary with waiver status
+- name: Display dot1x verification summary
+  ansible.builtin.debug:
+    msg:
+      - "=== DOT1X VERIFICATION SUMMARY ==="
+      - "Device: {{ inventory_hostname }}"
+      - "Target Interfaces: {{ expected.dot1x.target_interfaces | length }}"
+      - "Required RADIUS Servers: {{ expected.radius.get('servers', []) | length }}"
+      - ""
+      - "WAIVER STATUS:"
+      - "  - Global dot1x: {{ 'ACTIVE' if expected.dot1x.get('compliance_waive_global', false) else 'INACTIVE' }}"
+      - "  - RADIUS servers: {{ 'ACTIVE' if expected.radius.get('compliance_waive_servers', false) else 'INACTIVE' }}"
+      - "  - AAA authentication: {{ 'ACTIVE' if expected.aaa.get('compliance_waive_authn', false) else 'INACTIVE' }}"
+      - "  - AAA authorization: {{ 'ACTIVE' if expected.aaa.get('compliance_waive_authz', false) else 'INACTIVE' }}"
+      - "  - AAA accounting: {{ 'ACTIVE' if expected.aaa.get('compliance_waive_acct', false) else 'INACTIVE' }}"
+      - "  - Interface config: {{ 'ACTIVE' if expected.dot1x.get('compliance_waive_interfaces', false) else 'INACTIVE' }}"
+      - "  - Global timers: {{ 'ACTIVE' if expected.dot1x.get('compliance_waive_timers', false) else 'INACTIVE' }}"
+      - ""
+      - "Tests completed - Check individual test results above for FAILED BUT WAIVED items"

@@ -1,0 +1,261 @@
+---
+- name: Load common variables
+  include_vars: "{{ playbook_dir }}/../group_vars/all.yml"
+
+- name: Configure RADIUS server 1
+  cisco.ios.ios_config:
+    lines:
+      - "address ipv4 10.220.50.33 auth-port 1812 acct-port 1813"
+      - "timeout 5"
+      - "key {{ radius_key }}"
+    parents: "radius server FORESCOUT_RADIUS_VIP1"
+    before:
+      - end
+    after:
+      - end
+    match: exact
+    save_when: changed 
+
+
+- name: Configure RADIUS server 2
+  cisco.ios.ios_config:
+    lines:
+      - "address ipv4 10.220.50.34 auth-port 1812 acct-port 1813"
+      - "timeout 5"
+      - "key {{ radius_key }}"
+    parents: "radius server FORESCOUT_RADIUS_VIP2"
+    before:
+      - end
+    after:
+      - end
+    match: exact
+    save_when: changed 
+
+- name: Configure AAA group server
+  cisco.ios.ios_config:
+    lines:
+      - "server name FORESCOUT_RADIUS_VIP1"
+      - "server name FORESCOUT_RADIUS_VIP2"
+      - "ip radius source-interface Loopback0"
+      - "deadtime 5"
+    parents: "aaa group server radius FORESCOUT"
+    before:
+      - end
+    after:
+      - end
+    match: exact
+    save_when: changed 
+
+
+
+- name: Configure AAA authentication dot1x
+  cisco.ios.ios_config:
+    lines:
+      - "aaa authentication dot1x default group FORESCOUT"
+    save_when: changed 
+
+- name: Configure AAA authorization network
+  cisco.ios.ios_config:
+    lines:
+      - "aaa authorization network default group FORESCOUT"
+    save_when: changed 
+
+
+- name: Configure AAA accounting update
+  cisco.ios.ios_config:
+    lines:
+      - "aaa accounting update newinfo periodic 2880"
+    save_when: changed 
+
+- name: Configure AAA accounting identity with prompt handling
+  cisco.ios.ios_command:
+    commands:
+      - command: "configure terminal"
+      - command: "aaa accounting identity default start-stop group FORESCOUT"
+        prompt: '\[yes\]:'
+        answer: "Y"
+      - command: "end"
+
+
+- name: Configure AAA accounting network with prompt handling
+  cisco.ios.ios_command:
+    commands:
+      - command: "configure terminal"
+      - command: "aaa accounting network default start-stop group FORESCOUT"
+        prompt: '\[yes\]:'
+        answer: "Y"
+      - command: "end"
+
+
+- name: Radius attribute - Created by Champ
+  cisco.ios.ios_config:
+    lines: "{{ lookup('template', 'radius_attr.j2').splitlines() }}"
+    save_when: changed
+
+- name: Dot1x Config for Durairaj - Created by Champ
+  cisco.ios.ios_config:
+    lines:
+      - "dot1x system-auth-control"
+      - "dot1x critical eapol"
+    save_when: changed 
+
+- name: Access Session Gurdev - Created by Champ
+  cisco.ios.ios_config:
+    lines:
+      - "access-session mac-move deny"
+      - "access-session acl default passthrough"
+    save_when: changed 
+
+## ------ Class maps without j2 ---- ##
+
+- name: Configure control subscriber class-maps
+  cisco.ios.ios_config:
+    lines:
+      - match method dot1x
+      - match result-type method dot1x authoritative
+    parents: class-map type control subscriber match-all CM-DOT1X_FAILED
+  
+- name: Configure CM-DOT1X_NO_RESP class-map
+  cisco.ios.ios_config:
+    lines:
+      - match method dot1x
+      - match result-type method dot1x agent-not-found
+    parents: class-map type control subscriber match-all CM-DOT1X_NO_RESP
+
+- name: Configure CM-IN_FAILOPEN class-map
+  cisco.ios.ios_config:
+    lines:
+      - match activated-service-template TEMPLATE_FAILOPEN_DATA
+    parents: class-map type control subscriber match-any CM-IN_FAILOPEN
+
+- name: Configure CM-MAB_FAILED class-map
+  cisco.ios.ios_config:
+    lines:
+      - match method mab
+      - match result-type method mab authoritative
+    parents: class-map type control subscriber match-all CM-MAB_FAILED
+
+- name: Configure CM-NOT_IN_FAILOPN class-map
+  cisco.ios.ios_config:
+    lines:
+      - match activated-service-template TEMPLATE_FAILOPEN_DATA
+    parents: class-map type control subscriber match-none CM-NOT_IN_FAILOPN
+
+- name: Configure CM-SVRDOWN_AUTH class-map
+  cisco.ios.ios_config:
+    lines:
+      - match result-type aaa-timeout
+      - match authorization-status authorized
+    parents: class-map type control subscriber match-all CM-SVRDOWN_AUTH
+
+- name: Configure CM-SVRDOWN_UNAUTH class-map
+  cisco.ios.ios_config:
+    lines:
+      - match result-type aaa-timeout
+      - match authorization-status unauthorized
+    parents: class-map type control subscriber match-all CM-SVRDOWN_UNAUTH
+
+- name: Configure CM-TEST class-map
+  cisco.ios.ios_config:
+    lines:
+      - match method dot1x
+    parents: class-map type control subscriber match-all CM-TEST
+
+- name: Configure CM_CLIENT_VOICE class-map
+  cisco.ios.ios_config:
+    lines:
+      - match client-type voice
+    parents: class-map type control subscriber match-all CM_CLIENT_VOICE
+    
+# ----- Class mpa with j2 ------ #
+# - name: Class-Map Config for Gurdev - Created by Champ
+#   cisco.ios.ios_config:
+#     lines: "{{ lookup('template', 'classmap.j2').splitlines() }}"
+#     save_when: changed
+
+# - name: Policy-Map Event Session and Authentication failure - for Durairaj - Created by Champ
+#   cisco.ios.ios_config:
+#     lines: "{{ lookup('template', 'policymap.j2').splitlines() }}"
+#     save_when: changed
+
+# - name: Policy-Map Config for Durairaj  event agent-found match-all & event aaa-available match-all & event inactivity-timeout match-all - Created by Champ
+#   cisco.ios.ios_config:
+#     lines: "{{ lookup('template', 'policymap2.j2').splitlines() }}"
+#     save_when: changed
+
+# - name: Policy-Map Config for Durairaj - event violation match-all & event authentication-success match-first- Created by Champ
+#   cisco.ios.ios_config:
+#     lines: "{{ lookup('template', 'policymap3.j2').splitlines() }}"
+#     save_when: changed
+
+
+- name: Configure port authentication policy
+  cisco.ios.ios_config:
+    src: main-policy-map.j2
+  notify: save config
+
+- name: Configure dynamic authorization clients
+  cisco.ios.ios_config:
+    lines:
+      - "client 10.220.50.33 server-key {{ radius_key }}"
+      - "client 10.220.50.34 server-key {{ radius_key }}"
+    parents: "aaa server radius dynamic-author"
+    before:
+      - end
+    after:
+      - end
+    match: exact
+
+- name: access-session attributes filter-list -> sensor_list
+  cisco.ios.ios_config:
+    parents: access-session attributes filter-list list sensor_list
+    lines:
+      - cdp
+      - lldp
+      - dhcp
+
+- name: access-session accounting -> include sensor_list
+  cisco.ios.ios_config:
+    lines:
+      - access-session accounting attributes filter-spec include list sensor_list
+
+- name: device-sensor filter-list (DHCP)
+  cisco.ios.ios_config:
+    parents: device-sensor filter-list dhcp list dhcp-list
+    lines:
+      - option name host-name
+      - option name class-identifier
+      - option name client-identifier
+
+- name: device-sensor filter-list (LLDP)
+  cisco.ios.ios_config:
+    parents: device-sensor filter-list lldp list lldp-list
+    lines:
+      - tlv name system-name
+      - tlv name system-description
+      - tlv name system-capabilities
+
+- name: device-sensor filter-list (CDP)
+  cisco.ios.ios_config:
+    parents: device-sensor filter-list cdp list cdp-list
+    lines:
+      - tlv name device-name
+      - tlv name address-type
+      - tlv name capabilities-type
+      - tlv name version-type
+      - tlv name platform-type
+
+- name: device-sensor filter-spec include lists
+  cisco.ios.ios_config:
+    lines:
+      - device-sensor filter-spec dhcp include list dhcp-list
+      - device-sensor filter-spec lldp include list lldp-list
+      - device-sensor filter-spec cdp include list cdp-list
+
+- name: device-sensor notify all-changes (and save if modified)
+  cisco.ios.ios_config:
+    lines:
+      - device-sensor notify all-changes
+    save_when: changed
+
+

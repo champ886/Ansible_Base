@@ -1,0 +1,70 @@
+---
+- name: Get required secrets from CBA Enterprise Vault
+  hosts: npoc_switches_baseline:gcc_switches_baseline
+  gather_facts: false
+  become: false
+
+  vars_files:
+    - "{{ playbook_dir }}/../group_vars/npoc_switches_baseline.yml"
+  
+  vars_files:
+    - "{{ playbook_dir }}/../group_vars/gcc_switches_baseline.yml"
+
+  roles:
+    - role: cba.general.hashi_vault_logon
+      tags:
+        - always
+
+## Hashivault Creds Prod ##  
+  post_tasks:
+    - name: Get Cisco credentials from hashi vault
+      ansible.builtin.set_fact:
+        ansible_user: "{{ ansible_user_prod }}"
+        ansible_password: "{{ ansible_password_prod }}"
+        radius_key: "{{ radius_key_prod }}"
+      when: "'gcc_switches_baseline' in group_names"
+      tags:
+        - always
+      no_log: false
+
+
+## Hashivault Creds NPOC  ##  
+    - name: Get Cisco credentials from hashi vault_npoc
+      ansible.builtin.set_fact:
+        ansible_user: "{{ ansible_user_npoc }}"
+        ansible_password: "{{ ansible_password_npoc }}"
+        radius_key: "{{ radius_key_npoc }}"
+      when: "'npoc_switches_baseline' in group_names"
+      tags:
+        - always
+      no_log: false
+
+    # - name: Delegate passwords to localhost as well, can cause issues if not done
+    #   ansible.builtin.set_fact:
+    #     ansible_password: ""
+    #   tags:
+    #     - always
+    #   delegate_facts: true
+    #   delegate_to: localhost
+
+- name: Playbook for TVT
+  hosts: npoc_switches_baseline
+  gather_facts: no
+
+  tasks:
+  #   - name: Compliance Checks
+  #     ansible.builtin.include_role:
+  #       name: dot1x_tvt
+  #       tasks_from: verify_compliance.yml
+
+    - name: TVT Pre Checks
+      ansible.builtin.include_role:
+        name: dot1x_tvt
+        tasks_from: tvt.yml
+      tags: tvt-pre-checks
+
+    - name: TVT Post Checks
+      ansible.builtin.include_role:
+        name: dot1x_tvt
+        tasks_from: tvt.yml
+      tags: tvt-post-checks

@@ -1,0 +1,18 @@
+- name: Gather facts from Cisco IOS devices
+  hosts: npoc_switches_baseline
+  gather_facts: no
+
+  vars_files:
+    - /group_vars/all.yml
+    - /group_vars/npoc_switches_baseline.yml
+
+  tasks:
+  #   - name: Compliance Checks
+  #     ansible.builtin.include_role:
+  #       name: dot1x_tvt
+  #       tasks_from: verify_compliance.yml
+
+    - name: Dot1x Post-TVT Checks
+      ansible.builtin.include_role:
+        name: dot1x_tvt
+        tasks_from: verify_tvt_dot1x.yml

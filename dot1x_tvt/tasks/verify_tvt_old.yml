@@ -1,0 +1,313 @@
+---
+# 0) Load Vars
+- name: Load baseline expectations (common)
+  include_vars:
+    file: "dot1x_role/vars/expectations//expected_tvt_global.yml"
+    name: expected
+
+# 1) Ensure facts & config are present
+- name: Gather IOS facts (include running-config)
+  cisco.ios.ios_facts:
+    gather_subset: [config, hardware, interfaces, default]
+
+# Build handy lists from ansible_net_interfaces
+- name: Collect interface summaries
+  set_fact:
+    _if_items: "{{ ansible_net_interfaces | default({}) | dict2items }}"
+
+- name: Build list of interfaces that are UP
+  set_fact:
+    if_up_list: >-
+      {{
+        _if_items
+        | selectattr('value.operstatus','search','up')
+        | map(attribute='key')
+        | list
+      }}
+
+# Build [{'name': IFACE, 'ipv4': [ {address:, subnet:}, ... ]}, ...]
+- name: Build list of interfaces with IPv4 addresses
+  set_fact:
+    if_with_ip_list: []
+- name: Aggregate interfaces with IPv4 addresses
+  set_fact:
+    if_with_ip_list: "{{ if_with_ip_list + [ {'name': item.key, 'ipv4': item.value.ipv4 } ] }}"
+  loop: "{{ _if_items }}"
+  when: (item.value.ipv4 | default([])) | length > 0
+
+# (Nice to have) also flatten all IPv4s as strings iface:addr/prefix
+- name: Flatten IPv4s for reporting
+  set_fact:
+    if_ipv4_flat: >-
+      {{
+        if_with_ip_list
+        | map('combine', {'ipv4': (item.ipv4 | map('combine', {'prefix': (item2.subnet | default(''))}) ) })
+      }}
+  vars:
+    item2: {}
+  when: false  # (kept here only if you want to extend later)
+
+# Quick debug so you can see them plainly in the run
+- name: Show UP interfaces
+  debug:
+    var: if_up_list
+
+- name: Show interfaces with IPv4 addresses
+  debug:
+    msg: >-
+      Interface: {{ item.name }}, IPv4 addresses: {{ item.ipv4 }}
+  loop: "{{ if_with_ip_list }}"
+
+
+# Fallback if ansible_net_config missing
+- block:
+    - name: Show running-config (fallback)
+      cisco.ios.ios_command:
+        commands: [show running-config]
+      register: rc
+    - name: Set ansible_net_config from CLI
+      set_fact:
+        ansible_net_config: "{{ rc.stdout[0] }}"
+  when: ansible_net_config is not defined
+
+# Convenience vars
+- name: Normalize host/model/version
+  set_fact:
+    cfg_text: "{{ ansible_net_config | default('') }}"
+    hostname_actual: "{{ ansible_net_hostname | default(inventory_hostname) }}"
+    model_actual: "{{ ansible_net_model | default('') }}"
+    version_actual: "{{ ansible_net_version | default('') }}"
+
+# Start accumulator
+- set_fact:
+    compliance_results: []
+
+# Helper to append a result
+- name: Add a compliance result (macro-ish)
+  vars:
+    new_item: "{{ {'check': check, 'passed': passed | bool, 'info': info} }}"
+  set_fact:
+    compliance_results: "{{ (compliance_results | default([])) + [ new_item ] }}"
+  loop: []
+  loop_control: { label: "{{ item | default('') }}" }
+
+# 2) Hostname check (exists + regex optional)
+- name: Check hostname exists
+  set_fact:
+    _hostname_exists: "{{ (hostname_actual | trim | length) > 0 }}"
+- set_fact:
+    compliance_results: "{{ compliance_results + [ {'check':'hostname_exists', 'passed': _hostname_exists, 'info': hostname_actual} ] }}"
+
+- name: Check hostname regex (optional)
+  set_fact:
+    _hostname_regex_ok: "{{ (expected.hostname.regex is defined) and (hostname_actual is search(expected.hostname.regex)) }}"
+  when: expected.hostname is defined and expected.hostname.regex is defined
+- set_fact:
+    compliance_results: "{{ compliance_results + [ {'check':'hostname_regex', 'passed': (_hostname_regex_ok | default(true)), 'info': expected.hostname.regex | default('n/a') } ] }}"
+
+# 3) Model and Version
+- set_fact:
+    _model_ok: "{{ model_actual in (expected.model_any_of | default([model_actual])) }}"
+    _version_ok: >-
+      {{
+        (version_actual in (expected.version.exact_ok | default([])))
+        or ((expected.version.regex is defined) and (version_actual is search(expected.version.regex)))
+      }}
+- set_fact:
+    compliance_results: "{{ compliance_results + [
+      {'check':'model', 'passed': _model_ok, 'info': model_actual},
+      {'check':'version', 'passed': _version_ok, 'info': version_actual}
+    ] }}"
+
+# 4) AAA new-model (effective)
+- set_fact:
+    aaa_new_model_effective: >-
+      {{
+        (cfg_text is search('(?im)^\\s*aaa new-model\\b'))
+        or (cfg_text is search('(?im)^\\s*aaa\\s+(authentication|authorization|accounting)\\b'))
+      }}
+- set_fact:
+    compliance_results: "{{ compliance_results + [
+      {'check':'aaa_new_model_expected_false', 'passed': (not expected.aaa.new_model) implies (not aaa_new_model_effective),
+       'info': 'effective=' ~ (aaa_new_model_effective | string)}
+    ] }}"
+  when: expected.aaa is defined
+
+# 5) 802.1X global
+- set_fact:
+    dot1x_global_present: "{{ cfg_text is search('(?im)^\\s*dot1x system-auth-control\\b') }}"
+- set_fact:
+    compliance_results: "{{ compliance_results + [
+      {'check':'dot1x_global', 'passed': ( (expected.dot1x.expect_global_enabled | default(false)) == dot1x_global_present ),
+       'info': 'present=' ~ (dot1x_global_present | string)}
+    ] }}"
+  when: expected.dot1x is defined
+
+# 6) SNMP posture
+- set_fact:
+    snmp_rw_v2c_lines: "{{ cfg_text | regex_findall('(?im)^\\s*snmp-server community\\s+\\S+\\s+rw\\b.*$') }}"
+    snmp_ro_no_acl:     "{{ cfg_text | regex_findall('(?im)^\\s*snmp-server community\\s+(\\S+)\\s+ro\\s*$') }}"
+    snmp_v2c_hosts:     "{{ cfg_text | regex_findall('(?im)^\\s*snmp-server host .*\\bversion\\s+2c\\b.*$') }}"
+- set_fact:
+    compliance_results: "{{ compliance_results + [
+      {'check':'snmp_v2c_rw_forbidden', 'passed': (not expected.snmp.forbid_v2c_rw) or (snmp_rw_v2c_lines | length == 0),
+       'info': snmp_rw_v2c_lines },
+      {'check':'snmp_ro_requires_acl', 'passed': (not expected.snmp.ro_requires_acl) or (snmp_ro_no_acl | length == 0),
+       'info': snmp_ro_no_acl },
+      {'check':'snmp_v2c_hosts_forbidden', 'passed': (not expected.snmp.forbid_v2c_hosts) or (snmp_v2c_hosts | length == 0),
+       'info': snmp_v2c_hosts }
+    ] }}"
+  when: expected.snmp is defined
+
+# 7) Management plane
+- set_fact:
+    http_disabled: "{{ cfg_text is search('(?im)^\\s*no ip http server\\b') }}"
+    https_disabled: "{{ cfg_text is search('(?im)^\\s*no ip http secure-server\\b') }}"
+    ssh_v2: "{{ cfg_text is search('(?im)^\\s*ip ssh version\\s+2\\b') }}"
+    scp_enabled: "{{ cfg_text is search('(?im)^\\s*ip scp server enable\\b') }}"
+- set_fact:
+    compliance_results: "{{ compliance_results + [
+      {'check':'http_server_disabled',  'passed': (not expected.mgmt_plane.http_server_disabled) or  http_disabled, 'info': http_disabled },
+      {'check':'https_server_disabled', 'passed': (not expected.mgmt_plane.https_server_disabled) or https_disabled, 'info': https_disabled },
+      {'check':'ssh_version',            'passed': (expected.mgmt_plane.ssh_version | string) in (cfg_text | regex_search('(?im)^\\s*ip ssh version\\s+(\\d+)$', '\\1') | default('2')), 'info': 'found_v=' ~ (cfg_text | regex_search('(?im)^\\s*ip ssh version\\s+(\\d+)$','\\1') | default('absent')) },
+      {'check':'scp_enabled_ok',         'passed': (expected.mgmt_plane.scp_enabled_ok | default(true)) or (not scp_enabled), 'info': scp_enabled }
+    ] }}"
+  when: expected.mgmt_plane is defined
+
+# 8) Logging
+- set_fact:
+    log_src_ok: "{{ (expected.logging.require_source_interface | default('')) | length == 0
+                   or (cfg_text is search('(?im)^\\s*logging source-interface\\s+' ~ expected.logging.require_source_interface ~ '\\b')) }}"
+    log_host_present: "{{ (expected.logging.require_syslog_host | default(false)) | ternary((cfg_text is search('(?im)^\\s*logging host\\s+\\S+')), true) }}"
+- set_fact:
+    compliance_results: "{{ compliance_results + [
+      {'check':'logging_source_interface', 'passed': log_src_ok, 'info': expected.logging.require_source_interface | default('n/a') },
+      {'check':'logging_host_present',     'passed': log_host_present, 'info': '' }
+    ] }}"
+  when: expected.logging is defined
+
+# 9) NTP
+- set_fact:
+    ntp_auth: "{{ cfg_text is search('(?im)^\\s*ntp authenticate\\b') }}"
+    ntp_source_ok: "{{ cfg_text is search('(?im)^\\s*ntp source\\s+' ~ (expected.ntp.require_source | default('Loopback0')) ~ '\\b') }}"
+    ntp_srvs_found: "{{ cfg_text | regex_findall('(?im)^\\s*ntp server\\s+(\\S+)\\b') }}"
+    ntp_servers_ok: "{{ (expected.ntp.require_servers | default([])) | difference(ntp_srvs_found) | length == 0 }}"
+- set_fact:
+    compliance_results: "{{ compliance_results + [
+      {'check':'ntp_auth',       'passed': (not expected.ntp.require_auth) or ntp_auth, 'info': ntp_auth },
+      {'check':'ntp_source',     'passed': ntp_source_ok, 'info': expected.ntp.require_source | default('Loopback0') },
+      {'check':'ntp_servers',    'passed': ntp_servers_ok, 'info': 'found=' ~ (ntp_srvs_found | join(',')) }
+    ] }}"
+  when: expected.ntp is defined
+
+# 10) Routing/VRFs
+
+# - set_fact:
+#     ip_routing_on: "{{ cfg_text is search('(?im)^\\s*ip routing\\b') }}"
+#     vrfs_present: "{{ cfg_text | regex_findall('(?im)^\\s*vrf definition\\s+(\\S+)\\b') }}"
+#     vrfs_missing: "{{ (expected.vrfs_present | default([])) | difference(vrfs_present) }}"
+# - set_fact:
+#     compliance_results: "{{ compliance_results + [
+#       {'check':'ip_routing', 'passed': (not expected.ip_routing_required) or ip_routing_on, 'info': ip_routing_on },
+#       {'check':'vrfs_present','passed': (vrfs_missing | length) == 0, 'info': 'missing=' ~ (vrfs_missing | join(',')) }
+#     ] }}"
+
+
+- set_fact:
+    ip_routing_on: "{{ cfg_text is search('(?im)^\\s*ip routing\\b') }}"
+    vrfs_present: "{{ cfg_text | regex_findall('(?im)^\\s*vrf definition\\s+(\\S+)\\b') }}"
+    vrfs_missing: "{{ (expected.vrfs_present | default([])) | difference(vrfs_present) }}"
+
+- set_fact:
+    compliance_results: "{{ compliance_results + [
+      {'check':'ip_routing', 'passed': (not expected.ip_routing_required | default(false)) or ip_routing_on, 'info': ip_routing_on },
+      {'check':'vrfs_present','passed': (vrfs_missing | length) == 0, 'info': 'missing=' ~ (vrfs_missing | join(',')) }
+    ] }}"
+
+
+# 11) Capacity (CPU/Mem/Flash)
+- set_fact:
+    cpu_5s: "{{ ansible_net_cpu_utilization.core.five_seconds | int }}"
+    mem_free: "{{ ansible_net_memfree_mb | int }}"
+    flash_free: "{{ (ansible_net_filesystems_info['flash:'].spacefree_kb | default(0)) | int }}"
+- set_fact:
+    compliance_results: "{{ compliance_results + [
+      {'check':'cpu_5s_threshold', 'passed': cpu_5s <= (expected.capacity.cpu_5s_max | int), 'info': cpu_5s },
+      {'check':'mem_free_min_mb',  'passed': mem_free >= (expected.capacity.mem_free_min_mb | int), 'info': mem_free },
+      {'check':'flash_free_min_kb','passed': flash_free >= (expected.capacity.flash_free_min_kb | int), 'info': flash_free }
+    ] }}"
+  when: expected.capacity is defined
+
+# 12) Neighbors (LLDP/CDP from facts)
+# - set_fact:
+#     neighbors_count: "{{ (ansible_net_neighbors | default({})) | dict2items | map(attribute='value') | map('length') | list | sum | int }}"
+# - set_fact:
+#     compliance_results: "{{ compliance_results + [
+#       {'check':'neighbors_min', 'passed': neighbors_count >= (expected.neighbors_min | default(0)), 'info': neighbors_count }
+#     ] }}"
+
+- set_fact:
+    neighbors_count: "{{ (ansible_net_neighbors | default({})) | dict2items | map(attribute='value') | map('length') | sum | int }}"
+
+- set_fact:
+    compliance_results: "{{ compliance_results + [
+      {'check':'neighbors_min', 'passed': (neighbors_count | int) >= (expected.neighbors_min | default(0)), 'info': neighbors_count }
+    ] }}"
+
+# 13) Optional: flag SVIs that are up without an IP
+- set_fact:
+    svis_up_no_ip: >-
+      {{
+        (ansible_net_interfaces | dict2items)
+        | selectattr('key','search','^Vlan\\d+$')
+        | selectattr('value.operstatus','search','up')
+        | rejectattr('value.ipv4','length')
+        | map(attribute='key') | list
+      }}
+- set_fact:
+    compliance_results: "{{ compliance_results + [
+      {'check':'svis_up_without_ip', 'passed': (svis_up_no_ip | length) == 0, 'info': svis_up_no_ip }
+    ] }}"
+
+# 14) Summarize (and optionally enforce)
+- name: Summary — counts
+  vars:
+    failures: "{{ compliance_results | selectattr('passed','equalto',false) | list }}"
+  debug:
+    msg:
+      - "Checks run: {{ compliance_results | length }}"
+      - "Passed    : {{ compliance_results | selectattr('passed') | list | length }}"
+      - "Failed    : {{ failures | length }}"
+      - "Failed set: {{ failures | map(attribute='check') | list }}"
+
+
+- name: Create reports directory
+  file:
+    path: reports
+    state: directory
+    mode: '0755'
+  delegate_to: localhost
+  run_once: true
+
+- name: Write compliance report (HTML)
+  template:
+    src: report.md.j2
+    dest: "{{ playbook_dir }}/reports/{{ inventory_hostname }}.html"
+  delegate_to: localhost
+
+- name: Start local web server for reports
+  shell: "nohup python3 -m http.server 8080 --directory {{ playbook_dir }}/reports &"
+  delegate_to: localhost
+  run_once: true
+
+# - name: Write compliance report (markdown)
+#   template:
+#     src: report.md.j2
+#     dest: "reports/{{ inventory_hostname }}.md"
+
+# - name: Enforce failures (optional, via variable)
+#   vars:
+#     failures: "{{ compliance_results | selectattr('passed','equalto',false) | list }}"
+#   when: (compliance_enforce | bool) and (failures | length > 0)
+#   fail:
+#     msg: "{{ failures }}"

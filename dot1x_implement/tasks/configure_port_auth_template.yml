@@ -1,0 +1,25 @@
+---
+- name: Check if policy-map PORT-AUTH-POLICY exists
+  cisco.ios.ios_command:
+    commands:
+      - show policy-map type control subscriber PORT-AUTH-POLICY
+  register: policy_map_check
+  failed_when: false
+
+- name: Display message if PORT-AUTH-POLICY does not exist
+  ansible.builtin.debug:
+    msg: "WARNING: PORT-AUTH-POLICY does not exist. Skipping PORT-AUTH-TEMPLATE configuration."
+  when: 
+    - policy_map_check.stdout is not defined or
+      'Invalid input' in policy_map_check.stdout[0] or
+      'not found' in policy_map_check.stdout[0]
+
+- name: Configure template PORT-AUTH-TEMPLATE
+  cisco.ios.ios_config:
+    src: port_auth_template.j2
+    # parents: template PORT-AUTH-TEMPLATE
+    save_when: changed
+  when: 
+    - policy_map_check.stdout is defined
+    - "'Invalid input' not in policy_map_check.stdout[0]"
+    - "'not found' not in policy_map_check.stdout[0]"

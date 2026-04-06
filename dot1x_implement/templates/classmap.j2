@@ -1,0 +1,24 @@
+class-map type control subscriber match-all CM-DOT1X_FAILED
+ match method dot1x
+ match result-type method dot1x authoritative
+class-map type control subscriber match-all CM-DOT1X_NO_RESP
+ match method dot1x
+ match result-type method dot1x agent-not-found
+class-map type control subscriber match-any CM-IN_FAILOPEN
+ match activated-service-template TEMPLATE_FAILOPEN_DATA
+class-map type control subscriber match-all CM-MAB_FAILED
+ match method mab
+ match result-type method mab authoritative
+class-map type control subscriber match-none CM-NOT_IN_FAILOPN
+ match activated-service-template TEMPLATE_FAILOPEN_DATA
+class-map type control subscriber match-all CM-SVRDOWN_AUTH
+ match result-type aaa-timeout
+ match authorization-status authorized
+class-map type control subscriber match-all CM-SVRDOWN_UNAUTH
+ match result-type aaa-timeout
+ match authorization-status unauthorized
+class-map type control subscriber match-all CM-TEST
+ match method dot1x
+class-map type control subscriber match-all CM_CLIENT_VOICE
+ match client-type voice
+

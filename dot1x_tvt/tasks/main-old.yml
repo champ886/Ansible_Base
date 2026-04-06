@@ -1,0 +1,30 @@
+---
+# tasks file for dot1x_role
+- name: Gather IOS facts
+  cisco.ios.ios_facts:
+    gather_subset:
+      - hardware
+      - interfaces
+  register: ios_data
+
+- name: Show gathered facts
+  debug:
+    var: ios_data
+
+# 01_gather_ios.yml
+- name: Gather IOS facts
+  cisco.ios.ios_facts:
+    gather_subset:
+      - all
+  register: ios_data_all
+
+- name: Show gathered facts_all
+  debug:
+    var: ios_data_all
+  
+# Persist per-host data for downstream workflow jobs
+- name: Publish facts as workflow artifacts
+  ansible.builtin.set_stats:
+    data:
+      ios_facts_artifact: "{{ ansible_facts }}"
+    per_host: true

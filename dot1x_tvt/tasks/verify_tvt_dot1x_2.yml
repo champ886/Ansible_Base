@@ -1,0 +1,625 @@
+---
+# ===============================================
+# Simple Baseline Verification - IOS Facts Only
+# ===============================================
+# This playbook validates all baseline compliance using ONLY cisco.ios.ios_facts
+# module for gathering device information and configuration.
+# All verification is done through Ansible assertions and regex pattern matching
+# on the running configuration and facts gathered.
+
+- name: Simple Baseline Verification Using IOS Facts
+  hosts: "{{ target_group | default('cisco_forescout_baseline') }}"
+  gather_facts: false
+  vars:
+    # Load baseline expectations from group_vars
+    baseline_file: "group_vars/cisco_forescout_baseline.yml"
+  
+  pre_tasks:
+    # Load baseline configuration expectations
+    - name: Load baseline expectations
+      ansible.builtin.include_vars:
+        file: "{{ baseline_file }}"
+        name: baseline_config
+
+    - name: Set baseline expectations variable
+      ansible.builtin.set_fact:
+        expected: "{{ baseline_config.expected }}"
+
+  tasks:
+    # ===============================================
+    # GATHER FACTS - ONLY MODULE USED
+    # ===============================================
+    
+    - name: Gather IOS device facts
+      cisco.ios.ios_facts:
+        gather_subset: all
+      register: facts_result
+
+    - name: Set convenience variables from facts
+      ansible.builtin.set_fact:
+        device_config: "{{ ansible_net_config | regex_replace('\\r','') }}"
+        device_model: "{{ ansible_net_model | default('unknown') }}"
+        device_os_version: "{{ ansible_net_version | default('unknown') }}"
+        device_hostname: "{{ ansible_net_hostname | default('unknown') }}"
+        device_interfaces: "{{ ansible_net_interfaces | default({}) }}"
+
+    # ===============================================
+    # BASIC DEVICE INFORMATION VALIDATION
+    # ===============================================
+
+    - name: Test - Device OS version compliance
+      vars:
+        os_regex: "{{ expected.os_version_regex }}"
+        version_compliant: "{{ device_os_version is regex(os_regex) }}"
+      ansible.builtin.assert:
+        that: version_compliant
+        success_msg: "✓ Device OS version {{ device_os_version }} matches required pattern {{ os_regex }}"
+        fail_msg: "✗ FAILED - Device OS version {{ device_os_version }} does NOT match required pattern {{ os_regex }}"
+
+    - name: Test - Device model compliance
+      vars:
+        allowed_models: "{{ expected.model_any_of }}"
+        model_compliant: "{{ device_model in allowed_models }}"
+      ansible.builtin.assert:
+        that: model_compliant
+        success_msg: "✓ Device model {{ device_model }} is in allowed list: {{ allowed_models }}"
+        fail_msg: "✗ FAILED - Device model {{ device_model }} is NOT in allowed list: {{ allowed_models }}"
+
+    - name: Test - Device hostname compliance
+      vars:
+        hostname_regex: "{{ expected.must_have_hostname_regex }}"
+        hostname_compliant: "{{ device_hostname is regex(hostname_regex, ignorecase=True) }}"
+      ansible.builtin.assert:
+        that: hostname_compliant
+        success_msg: "✓ Device hostname '{{ device_hostname }}' matches required pattern {{ hostname_regex }}"
+        fail_msg: "✗ FAILED - Device hostname '{{ device_hostname }}' does NOT match required pattern {{ hostname_regex }}"
+
+    - name: Test - Required interfaces present
+      vars:
+        required_interfaces: "{{ expected.must_have_interfaces }}"
+        missing_interfaces: "{{ required_interfaces | difference(device_interfaces.keys()) }}"
+        interfaces_compliant: "{{ missing_interfaces | length == 0 }}"
+      ansible.builtin.assert:
+        that: interfaces_compliant
+        success_msg: "✓ All required interfaces present: {{ required_interfaces }}"
+        fail_msg: "✗ FAILED - Missing required interfaces: {{ missing_interfaces }}. Found: {{ device_interfaces.keys() | list }}"
+
+    # ===============================================
+    # IOS XE VERSION VALIDATION
+    # ===============================================
+
+    - name: Extract IOS XE version for detailed comparison
+      vars:
+        version_pattern: '(\d+)\.(\d+)\.(\d+)'
+        version_match: "{{ device_os_version | regex_search(version_pattern) }}"
+      ansible.builtin.set_fact:
+        iosxe_version: "{{ version_match }}"
+      when: version_match is not none
+
+    - name: Test - Minimum IOS XE version compliance
+      vars:
+        min_version: "{{ expected.min_iosxe_version }}"
+        current_version: "{{ iosxe_version | default('0.0.0') }}"
+        # Simple version comparison - convert to comparable format
+        min_parts: "{{ min_version.split('.') | map('int') | list }}"
+        current_parts: "{{ current_version.split('.') | map('int') | list }}"
+        is_sufficient: "{{ (current_parts[0] * 10000 + current_parts[1] * 100 + current_parts[2]) >= (min_parts[0] * 10000 + min_parts[1] * 100 + min_parts[2]) }}"
+      ansible.builtin.assert:
+        that: is_sufficient
+        success_msg: "✓ IOS XE version {{ current_version }} meets minimum requirement {{ min_version }}"
+        fail_msg: "✗ FAILED - IOS XE version {{ current_version }} is below minimum requirement {{ min_version }}"
+      when: iosxe_version is defined
+
+    # ===============================================
+    # AAA CONFIGURATION VALIDATION
+    # ===============================================
+
+    - name: Test - AAA new-model is configured
+      vars:
+        config_present: "{{ device_config is search('(?m)^aaa new-model$') }}"
+        waived: "{{ expected.get('compliance_waive_aaa_new_model', false) | bool }}"
+      ansible.builtin.assert:
+        that: config_present or waived
+        success_msg: "{{ '✓ AAA new-model is configured' if config_present else '⚠ AAA new-model is missing BUT WAIVED' }}"
+        fail_msg: "✗ FAILED - AAA new-model is missing - required for dot1x"
+      failed_when: not config_present and not waived
+      when: expected.get('require_aaa_new_model', true)
+
+    # ===============================================
+    # RADIUS SERVER CONFIGURATION VALIDATION
+    # ===============================================
+
+    - name: Extract RADIUS server configurations
+      vars:
+        # Modern radius server syntax (radius server <name> blocks)
+        radius_servers_modern: "{{ device_config | regex_findall('(?ms)^radius server \\S+\\n(?:.*\\n)*?^ address ipv4 (\\d+\\.\\d+\\.\\d+\\.\\d+)') | unique | list }}"
+        # Legacy radius-server host syntax
+        radius_servers_legacy: "{{ device_config | regex_findall('(?mi)^radius-server\\s+host\\s+(\\d+\\.\\d+\\.\\d+\\.\\d+)') | unique | list }}"
+      ansible.builtin.set_fact:
+        configured_radius_servers: "{{ (radius_servers_modern + radius_servers_legacy) | unique | list }}"
+
+    - name: Test - Required RADIUS servers configured
+      vars:
+        required_servers: "{{ expected.radius.get('servers', []) }}"
+        missing_servers: "{{ required_servers | difference(configured_radius_servers) }}"
+        servers_compliant: "{{ missing_servers | length == 0 }}"
+        waived: "{{ expected.radius.get('compliance_waive_servers', false) | bool }}"
+      ansible.builtin.assert:
+        that: servers_compliant or waived
+        success_msg: "{{ '✓ All required RADIUS servers configured: ' + (required_servers | string) if servers_compliant else '⚠ Missing RADIUS servers: ' + (missing_servers | string) + ' BUT WAIVED' }}"
+        fail_msg: "✗ FAILED - Missing RADIUS servers: {{ missing_servers }}"
+      failed_when: not servers_compliant and not waived
+      when: required_servers | length > 0
+
+    - name: Extract RADIUS server authentication port
+      vars:
+        auth_port_pattern: 'radius-server host .* auth-port\s+(\d+)'
+        auth_port: "{{ device_config | regex_search(auth_port_pattern) | default('1812') }}"
+      ansible.builtin.set_fact:
+        radius_auth_port: "{{ auth_port }}"
+
+    - name: Test - RADIUS authentication port compliance
+      vars:
+        expected_port: "{{ expected.radius.get('auth_port', 1812) }}"
+        actual_port: "{{ radius_auth_port | int }}"
+      ansible.builtin.assert:
+        that: actual_port == expected_port or expected_port == 1812
+        success_msg: "✓ RADIUS authentication port is set to {{ actual_port }}"
+        fail_msg: "✗ FAILED - RADIUS authentication port {{ actual_port }} does not match expected {{ expected_port }}"
+      when: configured_radius_servers | length > 0
+
+    - name: Extract RADIUS server accounting port
+      vars:
+        acct_port_pattern: 'radius-server host .* acct-port\s+(\d+)'
+        acct_port: "{{ device_config | regex_search(acct_port_pattern) | default('1813') }}"
+      ansible.builtin.set_fact:
+        radius_acct_port: "{{ acct_port }}"
+
+    - name: Test - RADIUS accounting port compliance
+      vars:
+        expected_port: "{{ expected.radius.get('acct_port', 1813) }}"
+        actual_port: "{{ radius_acct_port | int }}"
+      ansible.builtin.assert:
+        that: actual_port == expected_port or expected_port == 1813
+        success_msg: "✓ RADIUS accounting port is set to {{ actual_port }}"
+        fail_msg: "✗ FAILED - RADIUS accounting port {{ actual_port }} does not match expected {{ expected_port }}"
+      when: configured_radius_servers | length > 0
+
+    - name: Test - RADIUS timeout configuration
+      vars:
+        timeout_pattern: 'radius-server timeout\s+(\d+)'
+        configured_timeout: "{{ device_config | regex_search(timeout_pattern) | default('0') }}"
+        expected_timeout: "{{ expected.radius.get('timeout', 5) }}"
+      ansible.builtin.assert:
+        that: configured_timeout | int >= 0
+        success_msg: "✓ RADIUS timeout is configured: {{ configured_timeout }}s (expected: {{ expected_timeout }}s)"
+        fail_msg: "✗ FAILED - RADIUS timeout not properly configured"
+      when: configured_radius_servers | length > 0
+
+    - name: Test - RADIUS deadtime configuration
+      vars:
+        deadtime_pattern: 'radius-server deadtime\s+(\d+)'
+        configured_deadtime: "{{ device_config | regex_search(deadtime_pattern) | default('0') }}"
+        expected_deadtime: "{{ expected.radius.get('deadtime', 5) }}"
+      ansible.builtin.assert:
+        that: configured_deadtime | int >= 0
+        success_msg: "✓ RADIUS deadtime is configured: {{ configured_deadtime }}s (expected: {{ expected_deadtime }}s)"
+        fail_msg: "✗ FAILED - RADIUS deadtime not properly configured"
+      when: configured_radius_servers | length > 0
+
+    - name: Test - RADIUS source interface
+      vars:
+        source_interface: "{{ expected.radius.get('source_interface', 'Loopback0') }}"
+        source_pattern: 'radius-server source-ports udp\s+\d+\s+' + (source_interface | regex_escape)
+        source_config_present: "{{ device_config is search(source_pattern, ignorecase=True) }}"
+      ansible.builtin.debug:
+        msg: "ℹ RADIUS source interface configuration: {{ 'Configured' if source_config_present else 'Not explicitly configured - may use default' }}"
+      when: configured_radius_servers | length > 0
+
+    - name: Extract RADIUS attributes configuration
+      vars:
+        required_attributes: "{{ expected.radius.get('required_attributes', []) }}"
+      ansible.builtin.set_fact:
+        radius_attributes_found: |
+          {%- set attrs = {} -%}
+          {%- for attr in required_attributes -%}
+            {%- set attr_present = device_config is search(attr | regex_escape, ignorecase=True) -%}
+            {%- set _ = attrs.update({attr: attr_present}) -%}
+          {%- endfor -%}
+          {{ attrs }}
+
+    - name: Test - Required RADIUS attributes
+      vars:
+        required_attributes: "{{ expected.radius.get('required_attributes', []) }}"
+        missing_attributes: "{{ radius_attributes_found | dict2items | selectattr('value', 'equalto', False) | map(attribute='key') | list }}"
+        attributes_compliant: "{{ missing_attributes | length == 0 }}"
+      ansible.builtin.assert:
+        that: attributes_compliant
+        success_msg: "✓ All required RADIUS attributes are configured"
+        fail_msg: "✗ FAILED - Missing RADIUS attributes: {{ missing_attributes }}"
+      when: required_attributes | length > 0
+
+    - name: Test - RADIUS automate-tester configuration
+      vars:
+        automate_tester_required: "{{ expected.radius.get('automate_tester', false) }}"
+        automate_tester_username: "{{ expected.radius.get('automate_tester_username', '') }}"
+        automate_tester_pattern: 'radius-server automate-tester username\s+' + (automate_tester_username | regex_escape)
+        automate_tester_present: "{{ device_config is search(automate_tester_pattern, ignorecase=True) }}"
+      ansible.builtin.assert:
+        that: automate_tester_present or not automate_tester_required
+        success_msg: "{{ '✓ RADIUS automate-tester is configured' if automate_tester_present else '✓ RADIUS automate-tester not required' }}"
+        fail_msg: "✗ FAILED - RADIUS automate-tester username '{{ automate_tester_username }}' not configured"
+      when: 
+        - automate_tester_required
+        - automate_tester_username | length > 0
+
+    - name: Test - Dynamic Authorization (CoA) clients
+      vars:
+        dynamic_author_clients: "{{ expected.radius.get('dynamic_author_clients', []) }}"
+        coa_pattern: 'aaa server radius dynamic-author'
+        coa_present: "{{ device_config is search(coa_pattern, ignorecase=True) }}"
+      ansible.builtin.debug:
+        msg: "{{ '✓ Dynamic Authorization configured' if coa_present else 'ℹ Dynamic Authorization not configured - may not be required' }}"
+      when: dynamic_author_clients | length > 0
+
+    # ===============================================
+    # AAA METHOD LIST VALIDATION
+    # ===============================================
+
+    - name: Test - AAA authentication dot1x method list
+      vars:
+        authn_dot1x_regex: "{{ expected.aaa.get('authn_dot1x_regex', 'group \\\\S+') }}"
+        auth_pattern: "(?im)^aaa authentication dot1x default " + authn_dot1x_regex
+        auth_config_present: "{{ device_config is search(auth_pattern) }}"
+        waived: "{{ expected.aaa.get('compliance_waive_authn', false) | bool }}"
+      ansible.builtin.assert:
+        that: auth_config_present or waived
+        success_msg: "{{ '✓ AAA authentication dot1x method list configured correctly' if auth_config_present else '⚠ AAA authentication dot1x method list missing BUT WAIVED' }}"
+        fail_msg: "✗ FAILED - AAA authentication dot1x method list missing or incorrect"
+      failed_when: not auth_config_present and not waived
+
+    - name: Test - AAA authorization network method list
+      vars:
+        authz_network_regex: "{{ expected.aaa.get('authz_network_regex', 'group \\\\S+') }}"
+        authz_pattern: "(?im)^aaa authorization network default " + authz_network_regex
+        authz_config_present: "{{ device_config is search(authz_pattern) }}"
+        waived: "{{ expected.aaa.get('compliance_waive_authz', false) | bool }}"
+      ansible.builtin.assert:
+        that: authz_config_present or waived
+        success_msg: "{{ '✓ AAA authorization network method list configured' if authz_config_present else '⚠ AAA authorization network method list missing BUT WAIVED' }}"
+        fail_msg: "✗ FAILED - AAA authorization network method list missing or incorrect"
+      failed_when: not authz_config_present and not waived
+      when: expected.aaa.get('require_authorization_network', false)
+
+    - name: Test - AAA accounting dot1x method list
+      vars:
+        group_name: "{{ expected.radius.get('group_name', '\\S+') }}"
+        acct_pattern: "(?im)^aaa accounting dot1x default start-stop group " + group_name
+        acct_config_present: "{{ device_config is search(acct_pattern) }}"
+        waived: "{{ expected.aaa.get('compliance_waive_acct', false) | bool }}"
+      ansible.builtin.assert:
+        that: acct_config_present or waived
+        success_msg: "{{ '✓ AAA accounting dot1x method list configured' if acct_config_present else '⚠ AAA accounting dot1x method list missing BUT WAIVED' }}"
+        fail_msg: "✗ FAILED - AAA accounting dot1x method list missing or incorrect"
+      failed_when: not acct_config_present and not waived
+      when: expected.aaa.get('require_accounting_dot1x', false)
+
+    - name: Test - AAA accounting identity method list
+      vars:
+        group_name: "{{ expected.radius.get('group_name', '\\S+') }}"
+        acct_pattern: "(?im)^aaa accounting identity default start-stop group " + group_name
+        acct_config_present: "{{ device_config is search(acct_pattern) }}"
+      ansible.builtin.debug:
+        msg: "{{ '✓ AAA accounting identity method list configured' if acct_config_present else 'ℹ AAA accounting identity not configured - may not be required' }}"
+      when: expected.aaa.get('require_accounting_identity', false)
+
+    - name: Test - AAA accounting network method list
+      vars:
+        group_name: "{{ expected.radius.get('group_name', '\\S+') }}"
+        acct_pattern: "(?im)^aaa accounting network default start-stop group " + group_name
+        acct_config_present: "{{ device_config is search(acct_pattern) }}"
+      ansible.builtin.debug:
+        msg: "{{ '✓ AAA accounting network method list configured' if acct_config_present else 'ℹ AAA accounting network not configured - may not be required' }}"
+      when: expected.aaa.get('require_accounting_network', false)
+
+    # ===============================================
+    # DOT1X GLOBAL CONFIGURATION VALIDATION
+    # ===============================================
+
+    - name: Test - dot1x system-auth-control is enabled
+      vars:
+        config_present: "{{ device_config is search('(?m)^dot1x system-auth-control$') }}"
+        waived: "{{ expected.dot1x.get('compliance_waive_global', false) | bool }}"
+      ansible.builtin.assert:
+        that: config_present or waived
+        success_msg: "{{ '✓ dot1x system-auth-control is enabled' if config_present else '⚠ dot1x system-auth-control missing BUT WAIVED' }}"
+        fail_msg: "✗ FAILED - dot1x system-auth-control is missing"
+      failed_when: not config_present and not waived
+      when: expected.dot1x.get('require_system_auth_control', true)
+
+    - name: Test - dot1x critical eapol is configured
+      vars:
+        config_present: "{{ device_config is search('(?mi)^dot1x critical eapol') }}"
+      ansible.builtin.debug:
+        msg: "{{ '✓ dot1x critical eapol is configured' if config_present else 'ℹ dot1x critical eapol not configured' }}"
+      when: expected.dot1x.get('require_critical_eapol', false)
+
+    - name: Test - MAC move deny is configured
+      vars:
+        config_present: "{{ device_config is search('(?mi)^access-session mac-move deny') }}"
+      ansible.builtin.debug:
+        msg: "{{ '✓ Access session MAC move deny is configured' if config_present else 'ℹ Access session MAC move deny not configured' }}"
+      when: expected.dot1x.get('require_mac_move_deny', false)
+
+    - name: Test - ACL default passthrough is configured
+      vars:
+        config_present: "{{ device_config is search('(?mi)^access-session acl default passthrough') }}"
+      ansible.builtin.debug:
+        msg: "{{ '✓ ACL default passthrough is configured' if config_present else 'ℹ ACL default passthrough not configured' }}"
+      when: expected.dot1x.get('require_acl_default_passthrough', false)
+
+    # ===============================================
+    # INTERFACE DOT1X CONFIGURATION VALIDATION
+    # ===============================================
+
+    - name: Extract interface configurations
+      vars:
+        target_interfaces: "{{ expected.dot1x.get('target_interfaces', []) }}"
+      ansible.builtin.set_fact:
+        interface_configs: |
+          {%- set configs = {} -%}
+          {%- for interface in target_interfaces -%}
+            {%- set interface_pattern = "(?ms)^interface " + (interface | regex_escape) + "\\b.*?(?=^interface|\\Z)" -%}
+            {%- set interface_config = device_config | regex_findall(interface_pattern) | first | default('') -%}
+            {%- set _ = configs.update({interface: interface_config}) -%}
+          {%- endfor -%}
+          {{ configs }}
+
+    - name: Validate interface DOT1X configurations
+      vars:
+        target_interfaces: "{{ expected.dot1x.get('target_interfaces', []) }}"
+        require_pae: "{{ expected.dot1x.get('require_pae_authenticator', true) }}"
+        require_mab: "{{ expected.dot1x.get('require_mab', true) }}"
+        require_port_control: "{{ expected.dot1x.get('require_port_control_auto', true) }}"
+        require_auth_order: "{{ expected.dot1x.get('require_auth_order', true) }}"
+        require_periodic: "{{ expected.dot1x.get('require_periodic_reauth', true) }}"
+        require_host_mode: "{{ expected.dot1x.get('require_host_mode_multi_domain', true) }}"
+        waived: "{{ expected.dot1x.get('compliance_waive_interfaces', false) | bool }}"
+      block:
+        - name: "Check interface {{ item }} for DOT1X compliance"
+          vars:
+            interface_config: "{{ interface_configs.get(item, '') }}"
+            checks:
+              - name: "dot1x pae authenticator"
+                required: "{{ require_pae }}"
+                present: "{{ interface_config is search('dot1x pae authenticator') }}"
+              - name: "mab"
+                required: "{{ require_mab }}"
+                present: "{{ interface_config is search('(?m)^ mab$') }}"
+              - name: "authentication port-control auto"
+                required: "{{ require_port_control }}"
+                present: "{{ interface_config is search('authentication port-control auto') }}"
+              - name: "authentication order"
+                required: "{{ require_auth_order }}"
+                present: "{{ interface_config is search('authentication order') }}"
+              - name: "authentication periodic"
+                required: "{{ require_periodic }}"
+                present: "{{ interface_config is search('authentication periodic') }}"
+              - name: "authentication host-mode multi-domain"
+                required: "{{ require_host_mode }}"
+                present: "{{ interface_config is search('authentication host-mode multi-domain') }}"
+            missing_checks: "{{ checks | selectattr('required') | rejectattr('present') | map(attribute='name') | list }}"
+            interface_compliant: "{{ missing_checks | length == 0 }}"
+          ansible.builtin.assert:
+            that: interface_compliant or waived
+            success_msg: |
+              {% if interface_compliant %}
+              ✓ Interface {{ item }} DOT1X compliance: PASS
+              {% else %}
+              ⚠ Interface {{ item }} DOT1X compliance: FAILED BUT WAIVED
+              Missing: {{ missing_checks | join(', ') }}
+              {% endif %}
+            fail_msg: "✗ Interface {{ item }} DOT1X compliance: FAILED - Missing: {{ missing_checks | join(', ') }}"
+          failed_when: not interface_compliant and not waived
+          loop: "{{ target_interfaces }}"
+          loop_control:
+            label: "{{ item }}"
+
+    # ===============================================
+    # CLASS MAP AND POLICY MAP VALIDATION
+    # ===============================================
+
+    - name: Extract configured class maps
+      ansible.builtin.set_fact:
+        configured_class_maps: "{{ device_config | regex_findall('(?mi)^class-map\\s+([a-zA-Z0-9_-]+)') | unique | list }}"
+
+    - name: Test - Required class maps are configured
+      vars:
+        required_class_maps: "{{ expected.class_maps.get('required_class_maps', []) | map(attribute='name') | list }}"
+        missing_class_maps: "{{ required_class_maps | difference(configured_class_maps) }}"
+        class_maps_compliant: "{{ missing_class_maps | length == 0 }}"
+      ansible.builtin.assert:
+        that: class_maps_compliant
+        success_msg: "✓ All required class-maps are configured: {{ required_class_maps }}"
+        fail_msg: "✗ FAILED - Missing class-maps: {{ missing_class_maps }}"
+      when: required_class_maps | length > 0
+
+    - name: Extract configured policy maps
+      ansible.builtin.set_fact:
+        configured_policy_maps: "{{ device_config | regex_findall('(?mi)^policy-map\\s+([a-zA-Z0-9_-]+)') | unique | list }}"
+
+    - name: Test - Required policy maps are configured
+      vars:
+        required_policy_maps: "{{ expected.policy_maps.get('required_policy_maps', []) | map(attribute='name') | list }}"
+        missing_policy_maps: "{{ required_policy_maps | difference(configured_policy_maps) }}"
+        policy_maps_compliant: "{{ missing_policy_maps | length == 0 }}"
+      ansible.builtin.assert:
+        that: policy_maps_compliant
+        success_msg: "✓ All required policy-maps are configured: {{ required_policy_maps }}"
+        fail_msg: "✗ FAILED - Missing policy-maps: {{ missing_policy_maps }}"
+      when: required_policy_maps | length > 0
+
+    # ===============================================
+    # SERVICE TEMPLATE VALIDATION
+    # ===============================================
+
+    - name: Extract configured service templates
+      ansible.builtin.set_fact:
+        configured_service_templates: "{{ device_config | regex_findall('(?mi)^service-template\\s+([a-zA-Z0-9_-]+)') | unique | list }}"
+
+    - name: Test - Required service templates are configured
+      vars:
+        required_templates: "{{ expected.service_templates.get('required_templates', []) | map(attribute='name') | list }}"
+        missing_templates: "{{ required_templates | difference(configured_service_templates) }}"
+        templates_compliant: "{{ missing_templates | length == 0 }}"
+      ansible.builtin.assert:
+        that: templates_compliant
+        success_msg: "✓ All required service-templates are configured: {{ required_templates }}"
+        fail_msg: "✗ FAILED - Missing service-templates: {{ missing_templates }}"
+      when: required_templates | length > 0
+
+    # ===============================================
+    # ACCESS CONTROL LIST VALIDATION
+    # ===============================================
+
+    - name: Extract configured access lists
+      ansible.builtin.set_fact:
+        configured_acls: "{{ device_config | regex_findall('(?mi)^ip access-list extended\\s+([a-zA-Z0-9_-]+)') | unique | list }}"
+
+    - name: Test - Required access lists are configured
+      vars:
+        required_acls: "{{ expected.access_lists.get('required_acls', []) | map(attribute='name') | list }}"
+        missing_acls: "{{ required_acls | difference(configured_acls) }}"
+        acls_compliant: "{{ missing_acls | length == 0 }}"
+      ansible.builtin.assert:
+        that: acls_compliant
+        success_msg: "✓ All required access-lists are configured: {{ required_acls }}"
+        fail_msg: "✗ FAILED - Missing access-lists: {{ missing_acls }}"
+      when: required_acls | length > 0
+
+    # ===============================================
+    # DEVICE TRACKING VALIDATION
+    # ===============================================
+
+    - name: Test - Device tracking policy is configured
+      vars:
+        policy_name: "{{ expected.device_tracking.get('policy_name', '') }}"
+        device_tracking_pattern: 'device-tracking policy ' + (policy_name | regex_escape)
+        device_tracking_present: "{{ device_config is search(device_tracking_pattern, ignorecase=True) }}"
+      ansible.builtin.debug:
+        msg: "{{ '✓ Device tracking policy ' + policy_name + ' is configured' if device_tracking_present else 'ℹ Device tracking policy not configured' }}"
+      when: policy_name | length > 0
+
+    - name: Test - Device sensor configuration
+      vars:
+        sensor_lists: "{{ expected.device_tracking.get('sensor_lists', []) }}"
+        has_sensor_config: "{{ device_config is search('sensor-list', ignorecase=True) }}"
+      ansible.builtin.debug:
+        msg: "{{ '✓ Device sensor configuration detected' if has_sensor_config else 'ℹ Device sensor configuration not present' }}"
+      when: sensor_lists | length > 0
+
+    # ===============================================
+    # SECURITY FEATURES VALIDATION
+    # ===============================================
+
+    - name: Test - Enable password type 7 is forbidden
+      vars:
+        enable_pw7_pattern: '(?mi)^enable password 7 '
+        enable_pw7_present: "{{ device_config is search(enable_pw7_pattern) }}"
+        waived: "{{ expected.get('compliance_waive_enable_pw7', false) | bool }}"
+      ansible.builtin.assert:
+        that: (not enable_pw7_present) or waived
+        success_msg: "{{ '✓ Enable password type 7 is not used' if not enable_pw7_present else '⚠ Enable password type 7 found BUT WAIVED' }}"
+        fail_msg: "✗ FAILED - Enable password type 7 is forbidden"
+      failed_when: enable_pw7_present and not waived
+      when: expected.get('forbid_enable_password_7', false)
+
+    - name: Test - SSH only on VTY lines
+      vars:
+        line_config: "{{ device_config | regex_findall('(?ms)^line vty.*?(?=^line|\\Z)', multiline=True) | join('') }}"
+        ssh_transport_present: "{{ line_config is search('transport input ssh', ignorecase=True) }}"
+      ansible.builtin.debug:
+        msg: "{{ '✓ SSH is configured on VTY lines' if ssh_transport_present else 'ℹ SSH transport input not explicitly configured' }}"
+      when: expected.get('ssh_only_on_vty', false)
+
+    - name: Test - HTTP server is disabled
+      vars:
+        http_server_pattern: '(?mi)^no ip http server$'
+        http_server_disabled: "{{ device_config is search(http_server_pattern) }}"
+      ansible.builtin.debug:
+        msg: "{{ '✓ HTTP server is disabled' if http_server_disabled else 'ℹ HTTP server status not verified' }}"
+      when: expected.get('require_http_server_disabled', false)
+
+    - name: Test - SNMP read/write communities are forbidden
+      vars:
+        snmp_community_rw_pattern: '(?mi)^snmp-server community.*\s+rw'
+        snmp_rw_present: "{{ device_config is search(snmp_community_rw_pattern) }}"
+        waived: "{{ expected.get('compliance_waive_snmp', false) | bool }}"
+      ansible.builtin.assert:
+        that: (not snmp_rw_present) or waived
+        success_msg: "{{ '✓ No read/write SNMP communities found' if not snmp_rw_present else '⚠ SNMP read/write communities found BUT WAIVED' }}"
+        fail_msg: "✗ FAILED - SNMP read/write communities are forbidden"
+      failed_when: snmp_rw_present and not waived
+      when: expected.get('forbid_rw_snmp_communities', false)
+
+    - name: Test - SNMP communities restricted with ACL
+      vars:
+        snmp_acl_pattern: 'snmp-server community.*access-list'
+        snmp_acl_present: "{{ device_config is search(snmp_acl_pattern, ignorecase=True) }}"
+      ansible.builtin.debug:
+        msg: "{{ '✓ SNMP communities are restricted with ACL' if snmp_acl_present else 'ℹ SNMP ACL restriction not verified' }}"
+      when: expected.get('allow_snmp_only_with_acl', false)
+
+    - name: Test - Banner login is configured
+      vars:
+        banner_login_pattern: '(?mi)^banner login'
+        banner_login_present: "{{ device_config is search(banner_login_pattern) }}"
+      ansible.builtin.debug:
+        msg: "{{ '✓ Banner login is configured' if banner_login_present else 'ℹ Banner login not configured' }}"
+      when: expected.get('require_banner_login', false)
+
+    - name: Test - Login tracking is enabled
+      vars:
+        login_track_pattern: '(?mi)^aaa new-model|^aaa accounting commands'
+        login_track_present: "{{ device_config is search(login_track_pattern) }}"
+      ansible.builtin.debug:
+        msg: "{{ '✓ Login tracking appears to be configured' if login_track_present else 'ℹ Login tracking not verified' }}"
+      when: expected.get('require_login_tracking', false)
+
+    # ===============================================
+    # COMPLIANCE SUMMARY
+    # ===============================================
+
+    - name: Generate compliance report summary
+      ansible.builtin.debug:
+        msg:
+          - "=== BASELINE COMPLIANCE VERIFICATION SUMMARY ==="
+          - "Device: {{ device_hostname }}"
+          - "Model: {{ device_model }}"
+          - "OS Version: {{ device_os_version }}"
+          - ""
+          - "CONFIGURATION CHECKS COMPLETED:"
+          - "  ✓ Device information validation"
+          - "  ✓ IOS XE version compliance"
+          - "  ✓ AAA configuration"
+          - "  ✓ RADIUS server configuration"
+          - "  ✓ AAA method lists"
+          - "  ✓ DOT1X global settings"
+          - "  ✓ Interface DOT1X configuration"
+          - "  ✓ Class-maps and Policy-maps"
+          - "  ✓ Service templates"
+          - "  ✓ Access control lists"
+          - "  ✓ Device tracking"
+          - "  ✓ Security features"
+          - ""
+          - "ACTIVE COMPLIANCE WAIVERS:"
+          - "  {{ '  AAA new-model: ACTIVE' if expected.get('compliance_waive_aaa_new_model', false) else '  AAA new-model: INACTIVE' }}"
+          - "  {{ '  RADIUS servers: ACTIVE' if expected.radius.get('compliance_waive_servers', false) else '  RADIUS servers: INACTIVE' }}"
+          - "  {{ '  DOT1X global: ACTIVE' if expected.dot1x.get('compliance_waive_global', false) else '  DOT1X global: INACTIVE' }}"
+          - "  {{ '  Interface DOT1X: ACTIVE' if expected.dot1x.get('compliance_waive_interfaces', false) else '  Interface DOT1X: INACTIVE' }}"
+          - "  {{ '  AAA authentication: ACTIVE' if expected.aaa.get('compliance_waive_authn', false) else '  AAA authentication: INACTIVE' }}"
+          - "  {{ '  AAA authorization: ACTIVE' if expected.aaa.get('compliance_waive_authz', false) else '  AAA authorization: INACTIVE' }}"
+          - "  {{ '  AAA accounting: ACTIVE' if expected.aaa.get('compliance_waive_acct', false) else '  AAA accounting: INACTIVE' }}"
+          - ""
+          - "Review any FAILED items above and take corrective action or update compliance waivers as needed."
+

@@ -1,0 +1,13 @@
+---  
+- name: Ensure FORESCOUT RADIUS server group is configured
+  ios_config:
+    parents:
+      - aaa group server radius FORESCOUT
+    lines:
+      - server name FORESCOUT_RADIUS_VIP1
+      - server name FORESCOUT_RADIUS_VIP2
+      - ip radius source-interface Loopback0
+      - deadtime 5
+    match: line          # idempotent; only add missing lines
+    replace: line
+    save_when: changed   # write mem if changes occurred

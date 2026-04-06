@@ -1,0 +1,20 @@
+{% for interface_name, interface_data in ansible_net_interfaces.items() %}
+{% if interface_data.description is defined and interface_data.description %}
+{% set apply_dot1x = namespace(found=false) %}
+{% for keyword in dot1x_keywords_prod %}
+{% if keyword.lower() in interface_data.description.lower() %}
+{% set apply_dot1x.found = true %}
+{% endif %}
+{% endfor %}
+{% if apply_dot1x.found %}
+interface {{ interface_name }}
+  no switchport port-security maximum 3
+  no switchport port-security violation restrict
+  no switchport port-security aging time 5
+  no switchport port-security aging type inactivity
+  no switchport port-security	    
+  device-tracking attach-policy IPDT_POLICY
+  source template PORT-AUTH-TEMPLATE
+{% endif %}
+{% endif %}
+{% endfor %}

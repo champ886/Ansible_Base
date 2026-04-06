@@ -1,0 +1,42 @@
+---
+
+- name: Load common expectations
+  include_vars: "{{ playbook_dir }}/../group_vars/all.yml"
+
+- name: Load dot1x expectations
+  include_vars: "{{ playbook_dir }}/../group_vars/npoc_switches_baseline.yml"
+
+- name: Gather switch interface facts
+  cisco.ios.ios_facts:
+    gather_subset:
+      - interfaces
+
+- name: Sanity check (how many interfaces did we learn?)
+  ansible.builtin.debug:
+    msg: "Interfaces discovered: {{ (ansible_net_interfaces | default({})) | length }}"
+
+- name: Preview what the template will render
+  ansible.builtin.debug:
+    msg: "{{ lookup('template', 'templates/dot1x_config_copy.j2') }}"
+
+- name: Push 802.1X where description matches keywords
+  cisco.ios.ios_config:
+    src: dot1x_config_copy.j2
+
+# - name: Configure interface settings
+#   cisco.ios.ios_config:
+#     lines:
+#       - description test interface
+#       - no switchport
+#       - ip address 172.31.1.1 255.255.255.0
+#     parents: interface TenGigabitEthernet1/1/1
+#   register: ti_config
+
+# - name: Record Pre-check State
+#   ansible.builtin.set_stats:
+#     data:
+#       ti_config: "{{ ti_config }}"
+
+# - name: debug
+#   ansible.builtin.debug:
+#     var: ti_config.diff

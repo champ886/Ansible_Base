@@ -1,0 +1,359 @@
+---
+# -------------------------------
+# Load expectation baseline
+# -------------------------------
+# - name: Load TVT baseline (expected_tvt_global.yml)
+#   include_vars:
+#     file: "{{ role_path }}/vars/expectations/expected_tvt_global.yml"
+#     # name: expected
+- name: Load common expectations
+  include_vars: "{{ playbook_dir }}/../group_vars/all.yml"
+
+- name: Load dot1x expectations
+  include_vars: "{{ playbook_dir }}/../group_vars/npoc_switches_baseline.yml"
+# -------------------------------
+# Gather facts (+ running-config)
+# -------------------------------
+- name: Gather IOS facts (config, hardware, interfaces)
+  cisco.ios.ios_facts:
+    gather_subset: [config, hardware, interfaces, default]
+
+# If ansible_net_config sometimes isn't populated (older collections),
+# fall back to CLI and then continue with the assert-style flow.
+- block:
+    - name: Fallback — show running-config
+      cisco.ios.ios_command:
+        commands: [show running-config]
+      register: _rc
+    - name: Set ansible_net_config from fallback
+      set_fact:
+        ansible_net_config: "{{ _rc.stdout[0] }}"
+  when: ansible_net_config is not defined
+
+- name: Ensure running-config is available
+  assert:
+    that: ansible_net_config is defined
+    fail_msg: "ansible_net_config missing (did ios_facts run successfully?)"
+
+# Convenience vars
+- name: Normalize convenience variables
+  set_fact:
+    cfg: "{{ ansible_net_config | default('') }}"
+    ifs: "{{ ansible_net_interfaces | default({}) }}"
+    hn_actual: "{{ ansible_net_hostname | default(inventory_hostname) }}"
+    v_actual: "{{ ansible_net_version  | default('') }}"
+    m_actual: "{{ ansible_net_model    | default('') }}"
+
+# -------------------------------
+# Hostname checks
+# -------------------------------
+- name: Hostname must exist
+  assert:
+    that: (hn_actual | trim | length) > 0
+    success_msg: "Hostname present: {{ hn_actual }}"
+    fail_msg:    "Hostname is empty/undefined"
+
+# - name: Hostname must match regex (if provided)
+#   when: expected.hostname is defined and expected.hostname.regex is defined
+#   assert:
+#     that: hn_actual is search(expected.hostname.regex)
+#     success_msg: "Hostname '{{ hn_actual }}' matches regex {{ expected.hostname.regex }}"
+#     fail_msg:    "Hostname '{{ hn_actual }}' does NOT match regex {{ expected.hostname.regex }}"
+
+- name: Hostname must match regex (if provided)
+  when:
+    - expected.hostname is defined
+    - expected.hostname.regex is defined
+  assert:
+    that:
+      - ansible_net_hostname is search(expected.hostname.regex)
+
+
+# -------------------------------
+# Model / Version checks
+# -------------------------------
+- name: Model must be one of allowed
+  when: expected.model_any_of is defined
+  assert:
+    that: m_actual in expected.model_any_of
+    success_msg: "Model OK: {{ m_actual }}"
+    fail_msg:    "Model {{ m_actual }} not in {{ expected.model_any_of }}"
+
+# - name: Version must match (exact or regex)
+#   vars:
+#     version_ok: >-
+#       {{
+#         (v_actual in (expected.version.exact_ok | default([])))
+#         or (expected.version.regex is defined and (v_actual is search(expected.version.regex)))
+#       }}
+#   assert:
+#     that: version_ok
+#     success_msg: "Version OK: {{ v_actual }}"
+#     fail_msg:    "Version {{ v_actual }} not in {{ expected.version.exact_ok | default([]) }} and !~ {{ expected.version.regex | default('N/A') }}"
+
+- name: Version must match (exact or regex) — with waiver support
+  vars:
+    policy_defined: >-
+      {{
+        (expected.version is defined) and (
+          (expected.version.exact_ok | default([])) | length > 0
+          or (expected.version.regex is defined)
+        )
+      }}
+    version_ok: >-
+      {{
+        (ansible_net_version in (expected.version.exact_ok | default([])))
+        or (
+          (expected.version.regex is defined)
+          and (ansible_net_version is search(expected.version.regex))
+        )
+      }}
+    waived: "{{ expected.waive.version | default(false) | bool }}"
+    reason: "{{ expected.waive.version_reason | default('') }}"
+  when: policy_defined
+  assert:
+    that: version_ok
+    success_msg: "Version OK: {{ ansible_net_version }}"
+    fail_msg: "Version {{ ansible_net_version }} not in {{ expected.version.exact_ok | default([]) }} and !~ {{ expected.version.regex | default('N/A') }}"
+  failed_when: not version_ok and not waived
+  changed_when: false
+
+- name: NOTE — Version requirement WAIVED
+  when:
+    - (expected.version is defined)
+    - expected.waive.version | default(false)
+  debug:
+    msg: "WAIVED: version policy skipped for {{ inventory_hostname }}. {{ expected.waive.version_reason | default('') }}"
+
+
+# -------------------------------
+# AAA / 802.1X posture
+# -------------------------------
+- name: AAA new-model expected state
+  when: expected.aaa is defined and expected.aaa.new_model is defined
+  vars:
+    aaa_effective: >-
+      {{
+        (cfg is search('(?mi)^\\s*aaa\\s+new-model\\b'))
+        or (cfg is search('(?mi)^\\s*aaa\\s+(authentication|authorization|accounting)\\b'))
+      }}
+    want_enabled: "{{ expected.aaa.new_model | bool }}"
+  assert:
+    that:
+      - (want_enabled and aaa_effective) or ((not want_enabled) and (not aaa_effective))
+    success_msg: >-
+      AAA new-model {{ 'enabled' if aaa_effective else 'disabled' }} as expected
+    fail_msg: >-
+      AAA new-model mismatch. Effective={{ aaa_effective }} Expected={{ want_enabled }}
+
+- name: dot1x system-auth-control expected?
+  when: expected.dot1x is defined and expected.dot1x.expect_global_enabled is defined
+  vars:
+    dot1x_present: "{{ cfg is search('(?mi)^\\s*dot1x\\s+system-auth-control\\b') }}"
+    want: "{{ expected.dot1x.expect_global_enabled | bool }}"
+  assert:
+    that:
+      - (want and dot1x_present) or ((not want) and (not dot1x_present))
+    success_msg: "dot1x system-auth-control {{ 'present' if dot1x_present else 'absent' }} as expected"
+    fail_msg:    "dot1x system-auth-control {{ 'missing' if want else 'unexpectedly present' }}"
+
+# -------------------------------
+# SNMP posture
+# -------------------------------
+- name: Forbid v1/v2c RW communities
+  when: expected.snmp is defined and expected.snmp.forbid_v2c_rw | default(false)
+  vars:
+    rw_lines: "{{ cfg | regex_findall('(?mi)^\\s*snmp-server\\s+community\\s+\\S+\\s+rw\\b.*$') }}"
+  assert:
+    that: (rw_lines | length) == 0
+    success_msg: "No v1/v2c RW SNMP communities"
+    fail_msg:    "RW SNMP community present: {{ rw_lines | join('; ') }}"
+
+- name: Require ACL on RO communities
+  when: expected.snmp is defined and expected.snmp.ro_requires_acl | default(false)
+  vars:
+    ro_no_acl: "{{ cfg | regex_findall('(?mi)^\\s*snmp-server\\s+community\\s+\\S+\\s+ro\\s*$') }}"
+  assert:
+    that: (ro_no_acl | length) == 0
+    success_msg: "All RO SNMP communities have ACLs"
+    fail_msg:    "RO SNMP communities without ACL: {{ ro_no_acl | join('; ') }}"
+
+- name: Forbid v2c trap/host statements
+  when: expected.snmp is defined and expected.snmp.forbid_v2c_hosts | default(false)
+  vars:
+    v2c_hosts: "{{ cfg | regex_findall('(?mi)^\\s*snmp-server\\s+host\\s+.*\\bversion\\s+2c\\b.*$') }}"
+  assert:
+    that: (v2c_hosts | length) == 0
+    success_msg: "No SNMP v2c hosts configured"
+    fail_msg:    "SNMP v2c host lines present: {{ v2c_hosts | join('; ') }}"
+
+# -------------------------------
+# Management plane
+# -------------------------------
+- name: HTTP server must be disabled?
+  when: expected.mgmt_plane is defined and expected.mgmt_plane.http_server_disabled | default(false)
+  assert:
+    that: cfg is search('(?mi)^\\s*no\\s+ip\\s+http\\s+server\\b')
+    success_msg: "HTTP server disabled"
+    fail_msg:    "HTTP server is NOT disabled"
+
+- name: HTTPS server must be disabled?
+  when: expected.mgmt_plane is defined and expected.mgmt_plane.https_server_disabled | default(false)
+  assert:
+    that: cfg is search('(?mi)^\\s*no\\s+ip\\s+http\\s+secure-server\\b')
+    success_msg: "HTTPS server disabled"
+    fail_msg:    "HTTPS server is NOT disabled"
+
+- name: SSH version required
+  when: expected.mgmt_plane is defined and expected.mgmt_plane.ssh_version is defined
+  vars:
+    found_v: "{{ (cfg | regex_search('(?mi)^\\s*ip\\s+ssh\\s+version\\s+(\\d+)$','\\1')) | default('absent') }}"
+  assert:
+    that: (expected.mgmt_plane.ssh_version | string) == (found_v | string)
+    success_msg: "SSH version OK ({{ found_v }})"
+    fail_msg:    "SSH version {{ found_v }} != expected {{ expected.mgmt_plane.ssh_version }}"
+
+- name: SCP server allowed?
+  when: expected.mgmt_plane is defined and (expected.mgmt_plane.scp_enabled_ok is defined)
+  vars:
+    scp_on: "{{ cfg is search('(?mi)^\\s*ip\\s+scp\\s+server\\s+enable\\b') }}"
+    allowed: "{{ expected.mgmt_plane.scp_enabled_ok | bool }}"
+  assert:
+    that: allowed or (not scp_on)
+    success_msg: "SCP server state acceptable (enabled={{ scp_on }})"
+    fail_msg:    "SCP server must be disabled by policy"
+
+# -------------------------------
+# Logging
+# -------------------------------
+- name: Syslog source-interface required?
+  when: expected.logging is defined and expected.logging.require_source_interface is defined
+  assert:
+    that: cfg is search('(?mi)^\\s*logging\\s+source-interface\\s+{{ expected.logging.require_source_interface }}\\b')
+    success_msg: "Logging source-interface {{ expected.logging.require_source_interface }} configured"
+    fail_msg:    "Logging source-interface {{ expected.logging.require_source_interface }} missing"
+
+- name: At least one logging host required?
+  when: expected.logging is defined and expected.logging.require_syslog_host | default(false)
+  assert:
+    that: cfg is search('(?mi)^\\s*logging\\s+host\\s+\\S+')
+    success_msg: "Remote syslog host present"
+    fail_msg:    "No remote syslog host configured"
+
+# -------------------------------
+# NTP
+# -------------------------------
+- name: NTP authentication required?
+  when: expected.ntp is defined and expected.ntp.require_auth | default(false)
+  assert:
+    that:
+      - cfg is search('(?mi)^\\s*ntp\\s+authenticate\\b')
+      - cfg is search('(?mi)^\\s*ntp\\s+trusted-key\\s+\\d+\\b')
+    success_msg: "NTP authentication & trusted-key present"
+    fail_msg:    "NTP authentication/trusted-key missing"
+
+- name: NTP source-interface required?
+  when: expected.ntp is defined and expected.ntp.require_source is defined
+  assert:
+    that: cfg is search('(?mi)^\\s*ntp\\s+source\\s+{{ expected.ntp.require_source }}\\b')
+    success_msg: "NTP source {{ expected.ntp.require_source }} configured"
+    fail_msg:    "NTP source {{ expected.ntp.require_source }} missing"
+
+- name: NTP servers required?
+  when: expected.ntp is defined and (expected.ntp.require_servers | default([])) | length > 0
+  vars:
+    found: "{{ cfg | regex_findall('(?mi)^\\s*ntp\\s+server\\s+(\\S+)\\b') }}"
+    missing: "{{ (expected.ntp.require_servers | default([])) | difference(found) }}"
+  assert:
+    that: (missing | length) == 0
+    success_msg: "All required NTP servers present ({{ found | join(',') }})"
+    fail_msg:    "Missing NTP servers: {{ missing | join(',') }} (found={{ found | join(',') }})"
+
+# -------------------------------
+# Routing / VRFs
+# -------------------------------
+- name: ip routing required?
+  when: expected.ip_routing_required | default(false)
+  assert:
+    that: cfg is search('(?mi)^\\s*ip\\s+routing\\b')
+    success_msg: "ip routing enabled"
+    fail_msg:    "ip routing is NOT enabled"
+
+- name: Required VRFs present?
+  when: (expected.vrfs_present | default([])) | length > 0
+  vars:
+    vrfs_have: "{{ cfg | regex_findall('(?mi)^\\s*vrf\\s+definition\\s+(\\S+)\\b') }}"
+    vrfs_missing: "{{ (expected.vrfs_present | default([])) | difference(vrfs_have) }}"
+  assert:
+    that: (vrfs_missing | length) == 0
+    success_msg: "All required VRFs present"
+    fail_msg:    "Missing VRFs: {{ vrfs_missing | join(', ') }} (have: {{ vrfs_have | join(', ') }})"
+
+# -------------------------------
+# Capacity (CPU / Mem / Flash)
+# -------------------------------
+- name: CPU / Mem / Flash thresholds
+  when: expected.capacity is defined
+  assert:
+    that:
+      - (ansible_net_cpu_utilization.core.five_seconds | int) <= (expected.capacity.cpu_5s_max | int)
+      - (ansible_net_memfree_mb | int) >= (expected.capacity.mem_free_min_mb | int)
+      - ((ansible_net_filesystems_info['flash:'].spacefree_kb | default(0)) | int) >= (expected.capacity.flash_free_min_kb | int)
+    success_msg: >-
+      Capacity OK — CPU(5s)={{ ansible_net_cpu_utilization.core.five_seconds }}%, 
+      MemFree={{ ansible_net_memfree_mb | int }}MB, 
+      FlashFree={{ ansible_net_filesystems_info['flash:'].spacefree_kb | default(0) | int }}KB
+    fail_msg: >-
+      Capacity FAIL — CPU(5s)={{ ansible_net_cpu_utilization.core.five_seconds }}%, 
+      MemFree={{ ansible_net_memfree_mb | int }}MB, 
+      FlashFree={{ ansible_net_filesystems_info['flash:'].spacefree_kb | default(0) | int }}KB
+
+# -------------------------------
+# Neighbor count (from facts)
+# -------------------------------
+- name: Neighbors minimum
+  vars:
+    n_count: "{{ (ansible_net_neighbors | default({})) | dict2items | map(attribute='value') | map('length') | sum | int }}"
+    min_req: "{{ expected.neighbors_min | default(0) | int }}"
+  assert:
+    that: n_count >= min_req
+    success_msg: "Neighbors OK ({{ n_count }}) >= {{ min_req }}"
+    fail_msg:    "Neighbors too few ({{ n_count }}) < {{ min_req }}"
+
+# -------------------------------
+# Optional informational prints
+# -------------------------------
+- name: Show UP interfaces (info)
+  vars:
+    up_if: >-
+      {{
+        (ifs | dict2items)
+        | selectattr('value.operstatus','search','up')
+        | map(attribute='key') | list
+      }}
+  debug:
+    msg: "UP interfaces: {{ up_if | join(', ') }}"
+
+- name: Show interfaces with IPv4 addresses (info)
+  vars:
+    with_ip: >-
+      {{
+        (ifs | dict2items)
+        | selectattr('value.ipv4','defined')
+        | selectattr('value.ipv4','!=','')
+        | selectattr('value.ipv4')
+        | map(attribute='value')
+        | list
+      }}
+  debug:
+    var: with_ip
+
+# -------------------------------
+# Final summary banner
+# -------------------------------
+- name: Summary (hostname/model/version)
+  debug:
+    msg:
+      hostname: "{{ hn_actual }}"
+      model:    "{{ m_actual }}"
+      version:  "{{ v_actual }}"

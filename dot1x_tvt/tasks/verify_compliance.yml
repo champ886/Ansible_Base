@@ -1,0 +1,729 @@
+---
+- name: Load common variables
+  include_vars: "{{ playbook_dir }}/../group_vars/all.yml"
+
+- name: Load common variables
+  include_vars: "{{ playbook_dir }}/../group_vars/npoc_switches_baseline.yml"
+
+- name: TVT Pre-checks
+  tags: tvt-pre-checks
+  block:
+    - name: Forescout VIP 1 Check
+      cisco.ios.ios_command:
+        commands: "telnet {{ tvt_forescout_vip_1 }} 10003"
+      register: tvt_forescout_state
+      # failed_when: "'router' not in tvt_forescout_state.stdout"
+      ##################################################################
+      # Simulate pre-tvt failure
+      ##################################################################
+      # failed_when: 
+      #   - tvt_forescout_state.stdout is search('Destination unreachable')
+    
+    - name: Debug Forescout State
+      ansible.builtin.debug:
+        msg: "{{ tvt_forescout_state }}"
+        
+    - name: Show Running Config
+      cisco.ios.ios_command: 
+        commands: show run
+      register: tvt_pre_running_config
+    - name: Record Pre-check State
+      ansible.builtin.set_stats:
+        data:
+          tvt_forescout_state: "{{ tvt_forescout_state }}"
+          tvt_pre_running_config: "{{ tvt_pre_running_config }}"
+
+
+# - name: TVT Post-checks
+#   tags: tvt-post-checks
+#   block:
+    # - name: Verify RADIUS connection
+    #   cisco.ios.ios_command:
+    #     commands: "show aaa servers"
+    #   register: tvt_radius_state
+#     # - name: Verify RADIUS Authentication
+#     #   cisco.ios.ios_command:
+#     #     commands: "test aaa group radius server 10.220.50.33 champ champ legacy"
+#     #     interval: 10
+#     #   register: tvt_radius_authentication
+#     #   ignore_errors: true
+#     - name: Show Running Config
+#       cisco.ios.ios_command:
+#         commands: show run
+#       register: tvt_post_running_config
+#     - name: Compare Pre-to-Post Running Config
+#       ansible.utils.fact_diff:
+#         before: "{{ tvt_pre_running_config.stdout[0] | to_nice_yaml }}"
+#         after: "{{ tvt_post_running_config.stdout[0] | to_nice_yaml }}"
+#       register: tvt_running_config_diff
+#     - name: Record Post-check State
+      # ansible.builtin.set_stats:
+      #   data:
+      #     tvt_radius_state: "{{ tvt_radius_state }}"
+#           tvt_post_running_config: "{{ tvt_post_running_config }}"
+#           # tvt_radius_authentication: "{{ tvt_radius_authentication }}"
+#           tvt_running_config_diff: "{{ tvt_running_config_diff }}"
+#     - name: debug
+#       ansible.builtin.debug:
+#         var: ti_config.diff
+
+
+- name: TVT Post-checks
+  tags: tvt-post-checks
+  block:
+    # Test AAA RADIUS Connectivity
+    - name: Verify RADIUS connection
+      cisco.ios.ios_command:
+        commands: "show aaa servers"
+      register: tvt_radius_state
+      # failed_when: 
+      #   - tvt_radius_state.failed is defined
+      #   - tvt_radius_state.stdout is not defined or tvt_radius_state.stdout[0] == ""
+      failed_when: 
+       - tvt_radius_state.stdout[0] is search('current DOWN')
+
+    # Gather comprehensive device facts
+    - name: Gather device facts and configuration
+      cisco.ios.ios_facts:
+        gather_subset:
+          - all
+      register: device_facts
+
+    - name: Get full running configuration
+      cisco.ios.ios_command:
+        commands:
+          - show running-config
+      register: running_config_output
+
+    - name: Parse running config into variable
+      ansible.builtin.set_fact:
+        running_config: "{{ running_config_output.stdout[0] }}"
+
+    # Extract specific config sections using regex
+    - name: Extract RADIUS server configuration
+      ansible.builtin.set_fact:
+        radius_config: "{{ running_config | regex_findall('radius server \\S+[\\s\\S]*?(?=\\n\\S|\\n!|$)', multiline=True) }}"
+
+    - name: Extract AAA configuration
+      ansible.builtin.set_fact:
+        aaa_config: "{{ running_config | regex_findall('aaa .*', multiline=True) }}"
+
+    - name: Extract class-map configuration
+      ansible.builtin.set_fact:
+        classmap_config: "{{ running_config | regex_findall('class-map type control subscriber .*', multiline=True) }}"
+
+    - name: Extract service-template configuration
+      ansible.builtin.set_fact:
+        service_template_config: "{{ running_config | regex_findall('service-template .*', multiline=True) }}"
+
+    - name: Extract policy-map configuration
+      ansible.builtin.set_fact:
+        policymap_config: "{{ running_config | regex_findall('policy-map type control subscriber .*', multiline=True) }}"
+
+    - name: Extract dot1x configuration
+      ansible.builtin.set_fact:
+        dot1x_config: "{{ running_config | regex_findall('dot1x .*', multiline=True) }}"
+
+    - name: Extract access-session configuration
+      ansible.builtin.set_fact:
+        access_session_config: "{{ running_config | regex_findall('access-session .*', multiline=True) }}"
+
+    - name: Extract device-tracking configuration
+      ansible.builtin.set_fact:
+        device_tracking_config: "{{ running_config | regex_findall('device-tracking .*', multiline=True) }}"
+
+    - name: Extract device-sensor configuration
+      ansible.builtin.set_fact:
+        device_sensor_config: "{{ running_config | regex_findall('device-sensor .*', multiline=True) }}"
+
+    # ============================================
+    # RADIUS Server Compliance Checks
+    # ============================================
+    - name: Debug Radius servers
+      ansible.builtin.debug:
+        msg: "{{ radius_servers }}" 
+
+    - name: Check RADIUS servers against baseline
+      ansible.builtin.set_fact:
+        radius_server_results: "{{ radius_server_results | default([]) + [result] }}"
+      vars:
+        server_line: "radius server {{ item.name }}"
+        address_line: " address ipv4 {{ item.address }} auth-port {{ item.auth_port }} acct-port {{ item.acct_port }}"
+        timeout_line: " timeout {{ item.timeout }}"
+        server_found: "{{ server_line in running_config }}"
+        address_found: "{{ address_line in running_config }}"
+        timeout_found: "{{ timeout_line in running_config }}"
+        all_present: "{{ server_found and address_found and timeout_found }}"
+        result:
+          component: "RADIUS Server"
+          name: "{{ item.name }}"
+          address: "{{ item.address }}"
+          checks:
+            server_exists: "{{ 'PASS' if server_found else 'FAIL' }}"
+            address_config: "{{ 'PASS' if address_found else 'FAIL' }}"
+            timeout_config: "{{ 'PASS' if timeout_found else 'FAIL' }}"
+          overall_status: "{{ 'PASS' if all_present else 'FAIL' }}"
+          expected:
+            - "{{ server_line }}"
+            - "{{ address_line }}"
+            - "{{ timeout_line }}"
+          found: "{{ all_present }}"
+      loop: "{{ radius_servers }}"
+
+    # ============================================
+    # AAA Configuration Compliance Checks
+    # ============================================
+    - name: Check AAA authentication configuration
+      ansible.builtin.set_fact:
+        aaa_auth_results: "{{ aaa_auth_results | default([]) + [result] }}"
+      vars:
+        config_line: "aaa authentication {{ item.key }} default {{ item.value.default }}"
+        is_present: "{{ running_config is search(config_line | regex_escape) }}"
+        result:
+          component: "AAA Authentication"
+          name: "{{ item.key }}"
+          expected: "{{ config_line }}"
+          found: "{{ is_present }}"
+          status: "{{ 'PASS' if is_present else 'FAIL' }}"
+      loop: "{{ aaa_authentication | dict2items }}"
+
+    - name: Check AAA authorization configuration
+      ansible.builtin.set_fact:
+        aaa_authz_results: "{{ aaa_authz_results | default([]) + [result] }}"
+      vars:
+        config_line: "aaa authorization {{ item.key }} default {{ item.value.default }}"
+        is_present: "{{ running_config is search(config_line | regex_escape) }}"
+        result:
+          component: "AAA Authorization"
+          name: "{{ item.key }}"
+          expected: "{{ config_line }}"
+          found: "{{ is_present }}"
+          status: "{{ 'PASS' if is_present else 'FAIL' }}"
+      loop: "{{ aaa_authorization | dict2items }}"
+
+    - name: Check AAA accounting identity configuration
+      ansible.builtin.set_fact:
+        aaa_acct_identity_result:
+          component: "AAA Accounting"
+          name: "Identity"
+          expected: "aaa accounting identity default {{ aaa_accounting.identity_default }}"
+          found: "{{ 'aaa accounting identity default ' + aaa_accounting.identity_default in aaa_config }}"
+          status: "{{ 'PASS' if ('aaa accounting identity default ' + aaa_accounting.identity_default in aaa_config) else 'FAIL' }}"
+
+    - name: Check AAA accounting network configuration
+      ansible.builtin.set_fact:
+        aaa_acct_network_result:
+          component: "AAA Accounting"
+          name: "Network"
+          expected: "aaa accounting network default {{ aaa_accounting.network_default }}"
+          found: "{{ 'aaa accounting network default ' + aaa_accounting.network_default in aaa_config }}"
+          status: "{{ 'PASS' if ('aaa accounting network default ' + aaa_accounting.network_default in aaa_config) else 'FAIL' }}"
+
+    - name: Check AAA accounting update newinfo
+      ansible.builtin.set_fact:
+        aaa_acct_update_result:
+          component: "AAA Accounting"
+          name: "Update Newinfo"
+          expected: "aaa accounting update newinfo periodic {{ aaa_accounting.update_newinfo_periodic }}"
+          found: "{{ 'aaa accounting update newinfo periodic ' + (aaa_accounting.update_newinfo_periodic | string) in aaa_config }}"
+          status: "{{ 'PASS' if ('aaa accounting update newinfo periodic ' + (aaa_accounting.update_newinfo_periodic | string) in aaa_config) else 'FAIL' }}"
+    
+    # ============================================
+    # AAA Group Server Compliance Checks
+    # ============================================
+    - name: Check AAA group server configuration
+      ansible.builtin.set_fact:
+        aaa_group_results: "{{ aaa_group_results | default([]) + [result] }}"
+      vars:
+        group_line: "aaa group server {{ item.type }} {{ item.name }}"
+        server_lines: "{{ item.servers | map('regex_replace', '^(.*)$', ' server name \\1') | list }}"
+        source_line: " ip radius source-interface {{ item.source_interface }}"
+        deadtime_line: " deadtime {{ item.deadtime }}"
+        group_found: "{{ group_line in running_config }}"
+        servers_found: "{{ server_lines | select('in', running_config) | list | length == server_lines | length }}"
+        source_found: "{{ source_line in running_config }}"
+        deadtime_found: "{{ deadtime_line in running_config }}"
+        all_present: "{{ group_found and servers_found and source_found and deadtime_found }}"
+        result:
+          component: "AAA Group Server"
+          name: "{{ item.name }}"
+          type: "{{ item.type }}"
+          checks:
+            group_exists: "{{ 'PASS' if group_found else 'FAIL' }}"
+            servers_configured: "{{ 'PASS' if servers_found else 'FAIL' }}"
+            source_interface: "{{ 'PASS' if source_found else 'FAIL' }}"
+            deadtime: "{{ 'PASS' if deadtime_found else 'FAIL' }}"
+          overall_status: "{{ 'PASS' if all_present else 'FAIL' }}"
+          expected:
+            group: "{{ group_line }}"
+            servers: "{{ server_lines }}"
+            source: "{{ source_line }}"
+            deadtime: "{{ deadtime_line }}"
+      loop: "{{ aaa_group_servers }}"
+
+    # ============================================
+    # RADIUS Dynamic Author (CoA) Checks
+    # ============================================
+    - name: Check RADIUS dynamic author clients
+      ansible.builtin.set_fact:
+        radius_coa_results: "{{ radius_coa_results | default([]) + [result] }}"
+      vars:
+        client_line: " client {{ item.address }}"
+        is_present: "{{ client_line in running_config }}"
+        result:
+          component: "RADIUS Dynamic Author"
+          client: "{{ item.address }}"
+          expected: "{{ client_line }}"
+          found: "{{ is_present }}"
+          status: "{{ 'PASS' if is_present else 'FAIL' }}"
+      loop: "{{ radius_dynamic_author.clients }}"
+
+    # ============================================
+    # RADIUS Attributes Compliance Checks
+    # ============================================
+    - name: Check RADIUS attribute 6
+      ansible.builtin.set_fact:
+        radius_attr_6_result:
+          component: "RADIUS Attributes"
+          name: "Attribute 6"
+          expected: "radius-server attribute 6 on-for-login-auth"
+          found: "{{ 'radius-server attribute 6 on-for-login-auth' in running_config }}"
+          status: "{{ 'PASS' if ('radius-server attribute 6 on-for-login-auth' in running_config) else 'FAIL' }}"
+
+    - name: Check RADIUS attribute 8
+      ansible.builtin.set_fact:
+        radius_attr_8_result:
+          component: "RADIUS Attributes"
+          name: "Attribute 8"
+          expected: "radius-server attribute 8 include-in-access-req"
+          found: "{{ 'radius-server attribute 8 include-in-access-req' in running_config }}"
+          status: "{{ 'PASS' if ('radius-server attribute 8 include-in-access-req' in running_config) else 'FAIL' }}"
+
+    - name: Check RADIUS attribute 25
+      ansible.builtin.set_fact:
+        radius_attr_25_result:
+          component: "RADIUS Attributes"
+          name: "Attribute 25"
+          expected: "radius-server attribute 25 access-request include"
+          found: "{{ 'radius-server attribute 25 access-request include' in running_config }}"
+          status: "{{ 'PASS' if ('radius-server attribute 25 access-request include' in running_config) else 'FAIL' }}"
+
+    - name: Check RADIUS attribute 31 MAC format
+      ansible.builtin.set_fact:
+        radius_attr_31_result:
+          component: "RADIUS Attributes"
+          name: "Attribute 31 MAC Format"
+          expected: "radius-server attribute 31 mac format {{ radius_attributes.attribute_31.mac_format }}"
+          found: "{{ 'radius-server attribute 31 mac format ' + radius_attributes.attribute_31.mac_format in running_config }}"
+          status: "{{ 'PASS' if ('radius-server attribute 31 mac format ' + radius_attributes.attribute_31.mac_format in running_config) else 'FAIL' }}"
+
+    - name: Check RADIUS attribute 31 send NAS port detail
+      ansible.builtin.set_fact:
+        radius_attr_31_nas_result:
+          component: "RADIUS Attributes"
+          name: "Attribute 31 NAS Port Detail"
+          expected: "radius-server attribute 31 send nas-port-detail {{ radius_attributes.attribute_31.send_nas_port_detail }}"
+          found: "{{ 'radius-server attribute 31 send nas-port-detail ' + radius_attributes.attribute_31.send_nas_port_detail in running_config }}"
+          status: "{{ 'PASS' if ('radius-server attribute 31 send nas-port-detail ' + radius_attributes.attribute_31.send_nas_port_detail in running_config) else 'FAIL' }}"
+
+    - name: Check RADIUS attribute 32
+      ansible.builtin.set_fact:
+        radius_attr_32_result:
+          component: "RADIUS Attributes"
+          name: "Attribute 32"
+          expected: "radius-server attribute 32 include-in-access-req format {{ radius_attributes.attribute_32.format }}"
+          found: "{{ 'radius-server attribute 32 include-in-access-req format ' + radius_attributes.attribute_32.format in running_config }}"
+          status: "{{ 'PASS' if ('radius-server attribute 32 include-in-access-req format ' + radius_attributes.attribute_32.format in running_config) else 'FAIL' }}"
+
+    - name: Check RADIUS dead criteria
+      ansible.builtin.set_fact:
+        radius_dead_criteria_result:
+          component: "RADIUS Attributes"
+          name: "Dead Criteria"
+          expected: "radius-server dead-criteria time {{ radius_dead_criteria.time }} tries {{ radius_dead_criteria.tries }}"
+          found: "{{ 'radius-server dead-criteria time ' + (radius_dead_criteria.time | string) + ' tries ' + (radius_dead_criteria.tries | string) in running_config }}"
+          status: "{{ 'PASS' if ('radius-server dead-criteria time ' + (radius_dead_criteria.time | string) + ' tries ' + (radius_dead_criteria.tries | string) in running_config) else 'FAIL' }}"
+
+    - name: Check RADIUS deadtime
+      ansible.builtin.set_fact:
+        radius_deadtime_result:
+          component: "RADIUS Attributes"
+          name: "Deadtime"
+          expected: "radius-server deadtime {{ radius_deadtime }}"
+          found: "{{ 'radius-server deadtime ' + (radius_deadtime | string) in running_config }}"
+          status: "{{ 'PASS' if ('radius-server deadtime ' + (radius_deadtime | string) in running_config) else 'FAIL' }}"
+
+    # ============================================
+    # Class-map Compliance Checks
+    # ============================================
+    - name: Check class-maps against baseline
+      ansible.builtin.set_fact:
+        classmap_results: "{{ classmap_results | default([]) + [result] }}"
+      vars:
+        classmap_line: "class-map type {{ item.type }} {{ item.match }} {{ item.name }}"
+        is_present: "{{ classmap_line in classmap_config }}"
+        result:
+          component: "Class-map"
+          name: "{{ item.name }}"
+          type: "{{ item.type }}"
+          match: "{{ item.match }}"
+          expected: "{{ classmap_line }}"
+          found: "{{ is_present }}"
+          status: "{{ 'PASS' if is_present else 'FAIL' }}"
+      loop: "{{ class_maps }}"
+
+    # ============================================
+    # Service Template Compliance Checks
+    # ============================================
+    - name: Check service templates against baseline
+      ansible.builtin.set_fact:
+        service_template_results: "{{ service_template_results | default([]) + [result] }}"
+      vars:
+        template_line: "service-template {{ item.name }}"
+        is_present: "{{ template_line in service_template_config }}"
+        result:
+          component: "Service Template"
+          name: "{{ item.name }}"
+          expected: "{{ template_line }}"
+          found: "{{ is_present }}"
+          status: "{{ 'PASS' if is_present else 'FAIL' }}"
+      loop: "{{ service_templates }}"
+
+    # ============================================
+    # Policy-map Compliance Check
+    # ============================================
+    - name: Check policy-map configuration
+      ansible.builtin.set_fact:
+        policymap_result:
+          component: "Policy-map"
+          name: "{{ policy_map.name }}"
+          expected: "policy-map type {{ policy_map.type }} {{ policy_map.name }}"
+          found: "{{ 'policy-map type ' + policy_map.type + ' ' + policy_map.name in policymap_config }}"
+          status: "{{ 'PASS' if ('policy-map type ' + policy_map.type + ' ' + policy_map.name in policymap_config) else 'FAIL' }}"
+
+    # ============================================
+    # dot1x Configuration Compliance Checks
+    # ============================================
+    - name: Check dot1x system-auth-control
+      ansible.builtin.set_fact:
+        dot1x_sys_auth_result:
+          component: "dot1x"
+          name: "system-auth-control"
+          expected: "dot1x system-auth-control"
+          found: "{{ 'dot1x system-auth-control' in dot1x_config }}"
+          status: "{{ 'PASS' if ('dot1x system-auth-control' in dot1x_config) else 'FAIL' }}"
+      when: dot1x.system_auth_control | bool
+
+    - name: Check dot1x critical eapol
+      ansible.builtin.set_fact:
+        dot1x_critical_result:
+          component: "dot1x"
+          name: "critical eapol"
+          expected: "dot1x critical eapol"
+          found: "{{ 'dot1x critical eapol' in dot1x_config }}"
+          status: "{{ 'PASS' if ('dot1x critical eapol' in dot1x_config) else 'FAIL' }}"
+      when: dot1x.critical_eapol | bool
+
+    # ============================================
+    # Access-session Compliance Checks
+    # ============================================
+    - name: Check access-session mac-move
+      ansible.builtin.set_fact:
+        access_session_mac_result:
+          component: "Access Session"
+          name: "mac-move"
+          expected: "access-session mac-move {{ access_session.mac_move }}"
+          found: "{{ 'access-session mac-move ' + access_session.mac_move in access_session_config }}"
+          status: "{{ 'PASS' if ('access-session mac-move ' + access_session.mac_move in access_session_config) else 'FAIL' }}"
+
+    - name: Check access-session acl default
+      ansible.builtin.set_fact:
+        access_session_acl_result:
+          component: "Access Session"
+          name: "acl default"
+          expected: "access-session acl default {{ access_session.acl_default }}"
+          found: "{{ 'access-session acl default ' + access_session.acl_default in access_session_config }}"
+          status: "{{ 'PASS' if ('access-session acl default ' + access_session.acl_default in access_session_config) else 'FAIL' }}"
+
+    # ============================================
+    # Device Tracking Compliance Check
+    # ============================================
+    - name: Check device-tracking policy
+      ansible.builtin.set_fact:
+        device_tracking_result:
+          component: "Device Tracking"
+          name: "{{ device_tracking_policy.name }}"
+          expected: "device-tracking policy {{ device_tracking_policy.name }}"
+          found: "{{ 'device-tracking policy ' + device_tracking_policy.name in device_tracking_config }}"
+          status: "{{ 'PASS' if ('device-tracking policy ' + device_tracking_policy.name in device_tracking_config) else 'FAIL' }}"
+
+    # ============================================
+    # Device Sensor Compliance Check
+    # ============================================
+    - name: Check device-sensor notify all-changes
+      ansible.builtin.set_fact:
+        device_sensor_result:
+          component: "Device Sensor"
+          name: "notify all-changes"
+          expected: "device-sensor notify all-changes"
+          found: "{{ 'device-sensor notify all-changes' in device_sensor_config }}"
+          status: "{{ 'PASS' if ('device-sensor notify all-changes' in device_sensor_config and device_sensor.notify_all_changes) else 'FAIL' }}"
+      when: device_sensor.notify_all_changes | bool
+
+    # ============================================
+    # Interface Template Check
+    # ============================================
+    - name: Check interface template
+      ansible.builtin.set_fact:
+        interface_template_result:
+          component: "Interface Template"
+          name: "{{ interface_template.name }}"
+          expected: "template {{ interface_template.name }}"
+          found: "{{ 'template ' + interface_template.name in running_config }}"
+          status: "{{ 'PASS' if ('template ' + interface_template.name in running_config) else 'FAIL' }}"
+
+    # ============================================
+    # Generate Comprehensive Compliance Report
+    # ============================================
+    - name: Create detailed compliance report
+      ansible.builtin.set_fact:
+        compliance_report:
+          metadata:
+            device: "{{ inventory_hostname }}"
+            device_model: "{{ ansible_net_model | default('N/A') }}"
+            ios_version: "{{ ansible_net_version | default('N/A') }}"
+            hostname: "{{ ansible_net_hostname | default('N/A') }}"
+            serial_number: "{{ ansible_net_serialnum | default('N/A') }}"
+            check_date: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+            baseline_file: "forescout_baseline_vars.yml"
+          
+          radius_servers: "{{ radius_server_results | default([]) }}"
+          aaa_authentication: "{{ aaa_auth_results | default([]) }}"
+          aaa_authorization: "{{ aaa_authz_results | default([]) }}"
+          aaa_accounting:
+            - "{{ aaa_acct_identity_result }}"
+            - "{{ aaa_acct_network_result }}"
+            - "{{ aaa_acct_update_result }}"
+          aaa_group_servers: "{{ aaa_group_results | default([]) }}"
+          radius_dynamic_author: "{{ radius_coa_results | default([]) }}"
+          radius_attributes:
+            - "{{ radius_attr_6_result }}"
+            - "{{ radius_attr_8_result }}"
+            - "{{ radius_attr_25_result }}"
+            - "{{ radius_attr_31_result }}"
+            - "{{ radius_attr_31_nas_result }}"
+            - "{{ radius_attr_32_result }}"
+            - "{{ radius_dead_criteria_result }}"
+            - "{{ radius_deadtime_result }}"
+          class_maps: "{{ classmap_results | default([]) }}"
+          service_templates: "{{ service_template_results | default([]) }}"
+          policy_map: "{{ policymap_result }}"
+          dot1x_configuration:
+            - "{{ dot1x_sys_auth_result }}"
+            - "{{ dot1x_critical_result }}"
+          access_session:
+            - "{{ access_session_mac_result }}"
+            - "{{ access_session_acl_result }}"
+          device_tracking: "{{ device_tracking_result }}"
+          device_sensor: "{{ device_sensor_result }}"
+          interface_template: "{{ interface_template_result }}"
+          
+          summary:
+            total_checks: >-
+              {{ 
+                (radius_server_results | default([]) | length) +
+                (aaa_auth_results | default([]) | length) +
+                (aaa_authz_results | default([]) | length) +
+                3 +
+                (aaa_group_results | default([]) | length) +
+                (radius_coa_results | default([]) | length) +
+                8 +
+                (classmap_results | default([]) | length) +
+                (service_template_results | default([]) | length) +
+                1 +
+                2 +
+                2 +
+                1 +
+                1 +
+                1
+              }}
+            passed: >-
+              {{
+                (radius_server_results | default([]) | selectattr('overall_status', 'equalto', 'PASS') | list | length) +
+                (aaa_auth_results | default([]) | selectattr('status', 'equalto', 'PASS') | list | length) +
+                (aaa_authz_results | default([]) | selectattr('status', 'equalto', 'PASS') | list | length) +
+                ([aaa_acct_identity_result, aaa_acct_network_result, aaa_acct_update_result] | selectattr('status', 'equalto', 'PASS') | list | length) +
+                (aaa_group_results | default([]) | selectattr('overall_status', 'equalto', 'PASS') | list | length) +
+                (radius_coa_results | default([]) | selectattr('status', 'equalto', 'PASS') | list | length) +
+                ([radius_attr_6_result, radius_attr_8_result, radius_attr_25_result, radius_attr_31_result, radius_attr_31_nas_result, radius_attr_32_result, radius_dead_criteria_result, radius_deadtime_result] | selectattr('status', 'equalto', 'PASS') | list | length) +
+                (classmap_results | default([]) | selectattr('status', 'equalto', 'PASS') | list | length) +
+                (service_template_results | default([]) | selectattr('status', 'equalto', 'PASS') | list | length) +
+                (1 if policymap_result.status == 'PASS' else 0) +
+                ([dot1x_sys_auth_result, dot1x_critical_result] | selectattr('status', 'equalto', 'PASS') | list | length) +
+                ([access_session_mac_result, access_session_acl_result] | selectattr('status', 'equalto', 'PASS') | list | length) +
+                (1 if device_tracking_result.status == 'PASS' else 0) +
+                (1 if device_sensor_result.status == 'PASS' else 0) +
+                (1 if interface_template_result.status == 'PASS' else 0)
+              }}
+            failed: >-
+              {{
+                (radius_server_results | default([]) | selectattr('overall_status', 'equalto', 'FAIL') | list | length) +
+                (aaa_auth_results | default([]) | selectattr('status', 'equalto', 'FAIL') | list | length) +
+                (aaa_authz_results | default([]) | selectattr('status', 'equalto', 'FAIL') | list | length) +
+                ([aaa_acct_identity_result, aaa_acct_network_result, aaa_acct_update_result] | selectattr('status', 'equalto', 'FAIL') | list | length) +
+                (aaa_group_results | default([]) | selectattr('overall_status', 'equalto', 'FAIL') | list | length) +
+                (radius_coa_results | default([]) | selectattr('status', 'equalto', 'FAIL') | list | length) +
+                ([radius_attr_6_result, radius_attr_8_result, radius_attr_25_result, radius_attr_31_result, radius_attr_31_nas_result, radius_attr_32_result, radius_dead_criteria_result, radius_deadtime_result] | selectattr('status', 'equalto', 'FAIL') | list | length) +
+                (classmap_results | default([]) | selectattr('status', 'equalto', 'FAIL') | list | length) +
+                (service_template_results | default([]) | selectattr('status', 'equalto', 'FAIL') | list | length) +
+                (1 if policymap_result.status == 'FAIL' else 0) +
+                ([dot1x_sys_auth_result, dot1x_critical_result] | selectattr('status', 'equalto', 'FAIL') | list | length) +
+                ([access_session_mac_result, access_session_acl_result] | selectattr('status', 'equalto', 'FAIL') | list | length) +
+                (1 if device_tracking_result.status == 'FAIL' else 0) +
+                (1 if device_sensor_result.status == 'FAIL' else 0) +
+                (1 if interface_template_result.status == 'FAIL' else 0)
+              }}
+
+    # ============================================
+    # Display Compliance Results
+    # ============================================
+    - name: Display device metadata
+      ansible.builtin.debug:
+        msg:
+          - "========================================="
+          - "Device: {{ compliance_report.metadata.hostname }}"
+          - "Model: {{ compliance_report.metadata.device_model }}"
+          - "IOS Version: {{ compliance_report.metadata.ios_version }}"
+          - "Serial: {{ compliance_report.metadata.serial_number }}"
+          - "Check Date: {{ compliance_report.metadata.check_date }}"
+          - "========================================="
+
+    - name: Display RADIUS server results
+      ansible.builtin.debug:
+        msg: "RADIUS Server {{ item.name }} ({{ item.address }}): {{ item.overall_status }}"
+      loop: "{{ radius_server_results | default([]) }}"
+
+    - name: Display AAA authentication results
+      ansible.builtin.debug:
+        msg: "AAA Authentication {{ item.name }}: {{ item.status }}"
+      loop: "{{ aaa_auth_results | default([]) }}"
+
+    - name: Display AAA authorization results
+      ansible.builtin.debug:
+        msg: "AAA Authorization {{ item.name }}: {{ item.status }}"
+      loop: "{{ aaa_authz_results | default([]) }}"
+
+    - name: Display AAA accounting results
+      ansible.builtin.debug:
+        msg: "AAA Accounting {{ item.name }}: {{ item.status }}"
+      loop:
+        - "{{ aaa_acct_identity_result }}"
+        - "{{ aaa_acct_network_result }}"
+        - "{{ aaa_acct_update_result }}"
+
+    - name: Display AAA group server results
+      ansible.builtin.debug:
+        msg: "AAA Group Server {{ item.name }}: {{ item.overall_status }}"
+      loop: "{{ aaa_group_results | default([]) }}"
+
+    - name: Display RADIUS CoA client results
+      ansible.builtin.debug:
+        msg: "RADIUS CoA Client {{ item.client }}: {{ item.status }}"
+      loop: "{{ radius_coa_results | default([]) }}"
+
+    - name: Display RADIUS attributes results
+      ansible.builtin.debug:
+        msg: "RADIUS {{ item.name }}: {{ item.status }}"
+      loop:
+        - "{{ radius_attr_6_result }}"
+        - "{{ radius_attr_8_result }}"
+        - "{{ radius_attr_25_result }}"
+        - "{{ radius_attr_31_result }}"
+        - "{{ radius_attr_31_nas_result }}"
+        - "{{ radius_attr_32_result }}"
+        - "{{ radius_dead_criteria_result }}"
+        - "{{ radius_deadtime_result }}"
+
+    - name: Display class-map results
+      ansible.builtin.debug:
+        msg: "Class-map {{ item.name }}: {{ item.status }}"
+      loop: "{{ classmap_results | default([]) }}"
+
+    - name: Display service template results
+      ansible.builtin.debug:
+        msg: "Service Template {{ item.name }}: {{ item.status }}"
+      loop: "{{ service_template_results | default([]) }}"
+
+    - name: Display policy-map result
+      ansible.builtin.debug:
+        msg: "Policy-map {{ policymap_result.name }}: {{ policymap_result.status }}"
+
+    - name: Display dot1x results
+      ansible.builtin.debug:
+        msg: "dot1x {{ item.name }}: {{ item.status }}"
+      loop:
+        - "{{ dot1x_sys_auth_result }}"
+        - "{{ dot1x_critical_result }}"
+
+    - name: Display access-session results
+      ansible.builtin.debug:
+        msg: "Access Session {{ item.name }}: {{ item.status }}"
+      loop:
+        - "{{ access_session_mac_result }}"
+        - "{{ access_session_acl_result }}"
+
+    - name: Display device tracking result
+      ansible.builtin.debug:
+        msg: "Device Tracking {{ device_tracking_result.name }}: {{ device_tracking_result.status }}"
+
+    - name: Display device sensor result
+      ansible.builtin.debug:
+        msg: "Device Sensor {{ device_sensor_result.name }}: {{ device_sensor_result.status }}"
+
+    - name: Display interface template result
+      ansible.builtin.debug:
+        msg: "Interface Template {{ interface_template_result.name }}: {{ interface_template_result.status }}"
+
+    # ============================================
+    # Save Reports
+    # ============================================
+    - name: Ensure reports directory exists
+      ansible.builtin.file:
+        path: ./reports
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      run_once: true
+
+    - name: Save detailed compliance report (YAML)
+      ansible.builtin.copy:
+        content: "{{ compliance_report | to_nice_yaml(indent=2) }}"
+        dest: "./reports/{{ inventory_hostname }}_compliance_report.yml"
+        mode: '0644'
+      delegate_to: localhost
+
+    - name: Save detailed compliance report (JSON)
+      ansible.builtin.copy:
+        content: "{{ compliance_report | to_nice_json(indent=2) }}"
+        dest: "./reports/{{ inventory_hostname }}_compliance_report.json"
+        mode: '0644'
+      delegate_to: localhost
+
+    # ============================================
+    # Display Summary
+    # ============================================
+    - name: Display compliance summary
+      ansible.builtin.debug:
+        msg:
+          - "========================================="
+          - "COMPLIANCE SUMMARY FOR {{ inventory_hostname }}"
+          - "========================================="
+          - "Total Checks: {{ compliance_report.summary.total_checks }}"
+          - "Passed: {{ compliance_report.summary.passed }}"
+          - "Failed: {{ compliance_report.summary.failed }}"
+          - "Compliance Rate: {{ ((compliance_report.summary.passed | int) * 100 / (compliance_report.summary.total_checks | int)) | round(2) }}%"
+          - "========================================="
+          - "Reports saved to:"
+          - "  - ./reports/{{ inventory_hostname }}_compliance_report.yml"
+          - "  - ./reports/{{ inventory_hostname }}_compliance_report.json"
+          - "========================================="

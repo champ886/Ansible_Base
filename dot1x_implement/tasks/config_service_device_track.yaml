@@ -1,0 +1,66 @@
+---
+# -- with j2 --- #
+# - name: Configure service-template
+#   cisco.ios.ios_config:
+#     lines: "{{ lookup('template', 'service-template.j2').splitlines() }}"
+#     save_when: changed
+
+## --- without J2 --- ##
+- name: Configure DEFAULT_LINKSEC_POLICY_MUST_SECURE template
+  cisco.ios.ios_config:
+    lines:
+      - linksec policy must-secure
+    parents: service-template DEFAULT_LINKSEC_POLICY_MUST_SECURE
+
+- name: Configure DEFAULT_LINKSEC_POLICY_SHOULD_SECURE template
+  cisco.ios.ios_config:
+    lines:
+      - linksec policy should-secure
+    parents: service-template DEFAULT_LINKSEC_POLICY_SHOULD_SECURE
+
+- name: Configure DEFAULT_CRITICAL_VOICE_TEMPLATE
+  cisco.ios.ios_config:
+    lines:
+      - voice vlan
+    parents: service-template DEFAULT_CRITICAL_VOICE_TEMPLATE
+
+- name: Configure DEFAULT_CRITICAL_DATA_TEMPLATE
+  cisco.ios.ios_config:
+    parents: service-template DEFAULT_CRITICAL_DATA_TEMPLATE
+
+- name: Configure webauth-global-inactive template
+  cisco.ios.ios_config:
+    lines:
+      - inactivity-timer 3600
+    parents: service-template webauth-global-inactive
+
+- name: Configure TEMPLATE_PASS_AUTH_DATA
+  cisco.ios.ios_config:
+    lines:
+      - access-group al-fs-full-access-in
+    parents: service-template TEMPLATE_PASS_AUTH_DATA
+
+- name: Configure TEMPLATE_PASS_AUTH_VOICE
+  cisco.ios.ios_config:
+    lines:
+      - access-group al-fs-full-access-in
+      - voice vlan
+    parents: service-template TEMPLATE_PASS_AUTH_VOICE
+
+- name: Configure TEMPLATE_FAILOPEN_DATA
+  cisco.ios.ios_config:
+    lines:
+      - access-group al-fs-full-access-in
+    parents: service-template TEMPLATE_FAILOPEN_DATA
+
+- name: Configure TEMPLATE_FAILOPEN_VOICE
+  cisco.ios.ios_config:
+    lines:
+      - access-group al-fs-full-access-in
+      - voice vlan
+    parents: service-template TEMPLATE_FAILOPEN_VOICE
+
+- name: Configure device-tracking
+  cisco.ios.ios_config:
+    lines: "{{ lookup('template', 'device-tracking.j2').splitlines() }}"
+    save_when: changed

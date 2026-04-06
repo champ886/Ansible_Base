@@ -1,0 +1,32 @@
+---
+- name: Gather facts from Cisco IOS devices
+  hosts: npoc_switches_baseline
+  gather_facts: no
+
+  vars_files:
+    - /group_vars/all.yml
+    - /group_vars/npoc_switches_baseline.yml
+
+  tasks:
+    - name: implement_aaa_001
+      ansible.builtin.include_role:
+        name: dot1x_implement
+        tasks_from: test_implementation.yml
+        
+# - name: Playbook for Test Implementation
+#   hosts: all
+#   gather_facts: no
+
+#   vars_files:
+#     - "{{ playbook_dir }}/../group_vars/all.yml"
+    
+
+#   tasks:
+#     - name: Test Implementation
+#       ansible.builtin.include_role:
+#         name: dot1x_implement
+#         tasks_from: test_implementation
+      
+
+
+      

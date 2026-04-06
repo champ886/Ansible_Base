@@ -1,0 +1,102 @@
+---
+
+## GCC and NPOC Groups ##
+
+# - name: Get required secrets from CBA Enterprise Vault
+#   hosts: npoc_switches_baseline:gcc_switches_baseline
+#   gather_facts: false
+#   become: false
+
+#   vars_files:
+#     - "{{ playbook_dir }}/../group_vars/npoc_switches_baseline.yml"
+  
+#   vars_files:
+#     - "{{ playbook_dir }}/../group_vars/gcc_switches_baseline.yml"
+
+#   roles:
+#     - role: cba.general.hashi_vault_logon
+#       tags:
+#         - always
+
+## NPOC Group ONly
+- name: Get required secrets from CBA Enterprise Vault
+  hosts: npoc_switches_baseline
+  gather_facts: false
+  become: false
+
+  vars_files:
+    - "{{ playbook_dir }}/../group_vars/npoc_switches_baseline.yml"
+  
+  vars_files:
+    - "{{ playbook_dir }}/../group_vars/gcc_switches_baseline.yml"
+
+  roles:
+    - role: cba.general.hashi_vault_logon
+      tags:
+        - always
+
+## Hashivault Creds Prod ##  
+  post_tasks:
+    - name: Get Cisco credentials from hashi vault
+      ansible.builtin.set_fact:
+        ansible_user: "{{ ansible_user_prod }}"
+        ansible_password: "{{ ansible_password_prod }}"
+        radius_key: "{{ radius_key_prod }}"
+      when: "'gcc_switches_baseline' in group_names"
+      tags:
+        - always
+      no_log: false
+
+## Hashivault Creds NPOC ##  
+    - name: Get NPOC Cisco credentials from hashi vault
+      ansible.builtin.set_fact:
+        ansible_user: "{{ ansible_user_npoc }}"
+        ansible_password: "{{ ansible_password_npoc }}"
+        radius_key: "{{ radius_key_npoc }}"
+      when: "'npoc_switches_baseline' in group_names"
+      tags:
+        - always
+      no_log: true  # Changed to true for security
+
+## Hashivault Creds   ##  
+    - name: Delegate passwords to localhost as well, can cause issues if not done
+      ansible.builtin.set_fact:
+        ansible_password: ""
+      tags:
+        - always
+      # no_log: false
+      delegate_facts: true
+      delegate_to: localhost
+
+- name: Gather facts from Cisco IOS devices
+  hosts: npoc_switches_baseline
+  gather_facts: false
+
+  tasks:
+  
+    - name: implement_Radius_config
+      ansible.builtin.include_role:
+        name: dot1x_implement
+        tasks_from: radius_global.yml
+
+    - name: Configure access lists
+      ansible.builtin.include_role:
+        name: dot1x_implement
+        tasks_from: configure_access_lists.yml
+
+    - name: Configure port authentication template
+      ansible.builtin.include_role:
+        name: dot1x_implement
+        tasks_from: configure_port_auth_template.yml
+
+    - name: implement_service_temp_device_tracking
+      ansible.builtin.include_role:
+        name: dot1x_implement
+        tasks_from: config_service_device_track.yml
+
+    - name: implement_interface_config_Jinja
+      ansible.builtin.include_role:
+        name: dot1x_implement
+        tasks_from: test_dot1x_interface.yml
+
+

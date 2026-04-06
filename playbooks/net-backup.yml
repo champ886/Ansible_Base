@@ -1,0 +1,21 @@
+---
+
+- name: Create Network Backup and Push to GitHub
+  hosts: all
+  gather_facts: true
+  tasks:
+    - name: Create Network Backup
+      ansible.builtin.include_role:
+        name: backup
+      vars:
+        data_store:
+          scm:
+            origin:
+              user:
+                name: "ansible_backup"
+                email: "champion.nweke@cba.com.au"
+              url: "https://github.com/CBA-General/IWC-Network-Device-Backup"
+              token: "{{ gh_token }}"
+              filename: "demodate_{{ inventory_hostname }}.txt"
+              path: "backups/demodate/{{ inventory_hostname }}"
+      

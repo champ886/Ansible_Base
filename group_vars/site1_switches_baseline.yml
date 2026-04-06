@@ -1,0 +1,4 @@
+## Hashivault Vars Prod ##
+ansible_user_prod: "{{ lookup('community.hashi_vault.hashi_vault', 'secret=cba/iwc-vault/kv/data/service-accounts/AAP-serviceaccount:username') }}"
+ansible_password_prod: "{{ lookup('community.hashi_vault.hashi_vault', 'secret=cba/iwc-vault/kv/data/service-accounts/AAP-serviceaccount:password') }}"
+radius_key_prod: "{{ lookup('community.hashi_vault.hashi_vault', 'secret=cba/iwc-vault/kv/data/lab-cml:npoc-switch-radiuskey') }}"

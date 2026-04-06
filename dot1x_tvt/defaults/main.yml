@@ -1,0 +1,4 @@
+---
+# defaults file for dot1x_role
+expected: {}     # Intentionally empty; real values live under vars/expectations/*.yml
+# host_key_checking: False

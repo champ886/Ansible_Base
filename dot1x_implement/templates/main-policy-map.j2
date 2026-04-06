@@ -1,0 +1,47 @@
+policy-map type control subscriber {{ policy_name | default('PORT-AUTH-POLICY') }}
+ event session-started match-all
+  10 class always do-until-failure
+   10 authenticate using dot1x retries {{ dot1x_retries | default(2) }} retry-time {{ dot1x_retry_time | default(7) }} priority 10
+ event authentication-failure match-first
+  5 class CM-DOT1X_FAILED do-until-failure
+   10 terminate dot1x
+   20 authenticate using mab priority 20
+  10 class CM-SVRDOWN_UNAUTH do-until-failure
+   10 activate service-template {{ failopen_data_template | default('TEMPLATE_FAILOPEN_DATA') }}
+   15 activate service-template {{ failopen_voice_template | default('TEMPLATE_FAILOPEN_VOICE') }}
+   20 authorize
+   30 pause reauthentication
+  20 class CM-SVRDOWN_AUTH do-until-failure
+   10 pause reauthentication
+   20 authorize
+  30 class CM-DOT1X_NO_RESP do-until-failure
+   10 terminate dot1x
+   20 authenticate using mab priority 20
+  40 class CM-MAB_FAILED do-until-failure
+   10 terminate mab
+   20 authentication-restart {{ auth_restart_timer | default(60) }}
+  60 class always do-until-failure
+   10 terminate dot1x
+   20 terminate mab
+   30 authentication-restart {{ auth_restart_timer | default(60) }}
+ event agent-found match-all
+  10 class always do-until-failure
+   10 terminate mab
+   20 authenticate using dot1x retries {{ dot1x_retries | default(2) }} retry-time {{ dot1x_retry_time | default(7) }} priority 10
+ event aaa-available match-all
+  10 class CM-IN_FAILOPEN do-until-failure
+   10 clear-session
+  20 class CM-NOT_IN_FAILOPN do-until-failure
+   10 resume reauthentication
+ event inactivity-timeout match-all
+  10 class always do-until-failure
+   10 clear-session
+ event violation match-all
+  10 class always do-until-failure
+   10 restrict
+ event authentication-success match-first
+  5 class CM_CLIENT_VOICE do-until-failure
+   10 activate service-template {{ pass_auth_voice_template | default('TEMPLATE_PASS_AUTH_VOICE') }}
+  10 class always do-until-failure
+   10 activate service-template {{ pass_auth_data_template | default('TEMPLATE_PASS_AUTH_DATA') }}
+!
